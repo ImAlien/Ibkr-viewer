@@ -17,6 +17,7 @@
       <button class="nav-item" data-view="performance"><span class="nav-icon">⌁</span>盈亏表现</button>
       <button class="nav-item" data-view="activity"><span class="nav-icon">⇄</span>资金与分红</button>
       <button class="nav-item" data-view="trades"><span class="nav-icon">≋</span>交易记录</button>
+      <button class="nav-item" data-view="flex"><span class="nav-icon">↻</span>Flex API</button>
     </nav>
     <div class="sidebar-bottom"><div class="connection-dot"></div><span>本地账簿</span><span class="privacy">数据保存在此电脑</span></div>
   </aside>
@@ -24,24 +25,25 @@
   <main class="main">
     <header class="topbar">
       <div class="crumb">账户 <span>/</span> <select id="accountSelect" aria-label="选择账户"></select></div>
-      <div class="top-actions"><span class="updated" id="updatedLabel">等待导入账单</span><button class="primary-button" id="uploadOpen"><span>＋</span> 导入 CSV</button></div>
+      <div class="top-actions"><div class="period-controls"><label>从 <input id="rangeStart" type="date" /></label><label>到 <input id="rangeEnd" type="date" /></label><button class="range-apply" id="applyRange">应用</button></div><span class="updated" id="updatedLabel">等待导入账单</span><button class="primary-button" id="uploadOpen"><span>＋</span> 导入 CSV</button></div>
     </header>
     <section class="content" id="content"></section>
   </main>
 
   <dialog id="uploadDialog">
     <form method="dialog"><button class="dialog-close" aria-label="关闭">×</button></form>
-    <div class="eyebrow">同步账户数据</div><h2>导入 IBKR 活动账单</h2>
-    <p class="dialog-copy">选择从 IBKR 下载的 CSV 文件。重复文件和重叠日期会自动识别，原始交易明细会保留。</p>
+    <div class="eyebrow">同步账户数据</div><h2>导入 IBKR 活动账单或 Flex Query</h2>
+    <p class="dialog-copy">选择从 IBKR 下载的活动账单 CSV 或 Flex Query CSV。重复文件和重叠日期会自动识别，原始交易明细会保留。</p>
     <form id="uploadForm">
       <label class="drop-zone" id="dropZone"><input id="fileInput" name="file" type="file" accept=".csv,text/csv" multiple required />
-        <span class="upload-icon">↑</span><strong>点击选择文件，或拖放到这里</strong><span>支持同时选择多个 CSV · 每个文件最大 50 MB</span>
+        <span class="upload-icon">↑</span><strong>点击选择文件，或拖放到这里</strong><span>支持活动账单 / Flex Query CSV，可同时选择多个 · 每个文件最大 50 MB</span>
         <span class="file-list" id="fileList"></span>
       </label>
       <div class="upload-status" id="uploadStatus"></div>
       <button type="submit" class="primary-button upload-submit" id="uploadSubmit">导入账单</button>
     </form>
-    <div class="import-note">增量导入建议：每次上传新的活动账单即可。重叠的交易、股息和资金记录会去重，期末持仓以最新账单为准。</div>
+    <div class="clear-imports-row"><div><strong>重新开始导入</strong><span>清除本机账本里的所有导入记录；Flex 配置和已下载 CSV 文件会保留。</span></div><button type="button" class="danger-button" id="clearImports">清空已导入数据</button></div>
+    <div class="import-note">增量导入建议：每次上传新的活动账单即可。重叠的交易、股息和资金记录会去重；持仓和资产快照可按所选结束日期回看。</div>
   </dialog>
   <div class="toast" id="toast"></div>
   <script src="/app.js"></script>
