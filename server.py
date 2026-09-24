@@ -157,8 +157,33 @@ def v(row, label, index=None):
     return vals[index] if index is not None and len(vals) > index else ""
 
 
+def is_summary_currency(currency):
+    return str(currency or "").startswith(("总数", "Total"))
+
+
 def latest_snapshot(records):
     return records
+
+
+def cashflow_fx_rates(records, base_currency):
+    """Read IBKR's per-currency translated subtotals for a cashflow section."""
+    current_currency = None
+    original_totals = {}
+    base_totals = {}
+    for row in records:
+        currency = v(row, "货币", 0)
+        amount = n(v(row, "金额", 3))
+        if currency == "总数":
+            if current_currency:
+                original_totals[current_currency] = amount
+        elif currency == f"总数 {base_currency}":
+            if current_currency:
+                base_totals[current_currency] = amount
+        elif currency and v(row, "结算日期", 1):
+            current_currency = currency
+    return {currency: base_totals[currency] / total
+            for currency, total in original_totals.items()
+            if total and currency in base_totals}
 
 
 def summary(db, account=None):
@@ -181,17 +206,27 @@ def summary(db, account=None):
     cashflows = []
     dividends, tax, interest = [], [], []
     for imp in selected:
-        for r in unpack(db, imp["id"], "存款和取款"):
+        statement_cashflows = unpack(db, imp["id"], "存款和取款")
+        fx_rates = cashflow_fx_rates(statement_cashflows, imp.get("base_currency") or "USD")
+        for r in statement_cashflows:
             amount = v(r, "金额", 3)
-            if amount and v(r, "货币", 0) != "总数":
-                cashflows.append({"date": v(r, "结算日期", 1), "currency": v(r, "货币", 0),
-                                  "description": v(r, "描述", 2), "amount": n(amount), "period": imp["period_end"]})
+            currency = v(r, "货币", 0)
+            if amount and not is_summary_currency(currency):
+                cashflows.append({"date": v(r, "结算日期", 1), "currency": currency,
+                                  "description": v(r, "描述", 2), "amount": n(amount),
+                                  "_base_amount": n(amount) * fx_rates.get(currency, 1 if currency == (imp.get("base_currency") or "USD") else 0),
+                                  "period": imp["period_end"]})
         for section, target in (("股息", dividends), ("代扣税", tax), ("利息", interest)):
-            for r in unpack(db, imp["id"], section):
+            records = unpack(db, imp["id"], section)
+            section_fx_rates = cashflow_fx_rates(records, imp.get("base_currency") or "USD")
+            for r in records:
                 amount = v(r, "金额", 3)
-                if amount and v(r, "货币", 0) != "总数":
-                    target.append({"date": v(r, "日期", 1), "currency": v(r, "货币", 0),
-                                   "description": v(r, "描述", 2), "amount": n(amount), "period": imp["period_end"]})
+                currency = v(r, "货币", 0)
+                if amount and not is_summary_currency(currency):
+                    target.append({"date": v(r, "日期", 1), "currency": currency,
+                                   "description": v(r, "描述", 2), "amount": n(amount),
+                                   "_base_amount": n(amount) * section_fx_rates.get(currency, 1 if currency == (imp.get("base_currency") or "USD") else 0),
+                                   "period": imp["period_end"]})
     # Remove exact overlap rows while retaining legitimate identical occurrences from a single statement.
     def dedupe(events):
         seen = set(); out = []; counts = Counter()
@@ -208,12 +243,12 @@ def summary(db, account=None):
     # Use the current statement's realized/unrealized totals and NAV movement as report-period figures.
     realized_pnl = n(v(realized_total, "总数", 13)) if realized_total else 0
     report_change = next((n(v(r, "域值", 1)) for r in pnl_change if v(r, "域名称", 0) == "按市值计价"), 0)
-    # The summaries below use the account's base currency; individual events retain their original currency.
-    net_flows = sum(e["amount"] for e in cashflows if e["currency"] == latest.get("base_currency"))
+    # Convert each currency using IBKR's translated subtotals; detail rows retain their original currency.
+    net_flows = sum(e["_base_amount"] for e in cashflows)
     deposit_total = net_flows
-    base_dividends = sum(e["amount"] for e in dividends if e["currency"] == latest.get("base_currency"))
-    base_tax = sum(e["amount"] for e in tax if e["currency"] == latest.get("base_currency"))
-    base_interest = sum(e["amount"] for e in interest if e["currency"] == latest.get("base_currency"))
+    base_dividends = sum(e["_base_amount"] for e in dividends)
+    base_tax = sum(e["_base_amount"] for e in tax)
+    base_interest = sum(e["_base_amount"] for e in interest)
     nlv_value = n(v(nav_total, "当前合计", 4)) if nav_total else 0
     cash_value = n(v(nav_cash, "当前合计", 4)) if nav_cash else 0
     equity_value = n(v(nav_equity, "当前合计", 4)) if nav_equity else 0
@@ -248,6 +283,9 @@ def summary(db, account=None):
         if asset and asset not in ("总数", "Total") and v(r, "代码", 1):
             pnl_assets.append({"asset": asset, "symbol": v(r, "代码", 1), "realized": n(v(r, "已实现的 总数", 7)),
                                "unrealized": n(v(r, "未实现的 总数", 12)), "total": n(v(r, "总数", 13))})
+    for events in (cashflows, dividends, tax, interest):
+        for event in events:
+            event.pop("_base_amount", None)
     return {"empty": False, "account": account, "accounts": accounts, "latest": latest,
             "imports": selected, "base_currency": latest.get("base_currency") or "USD",
             "kpis": {"net_liquidation": nlv_value, "cash": cash_value, "stocks": equity_value,
