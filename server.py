@@ -151,7 +151,7 @@ def n(value):
 
 
 def v(row, label, index=None):
-    if label in row:
+    if label in row and row[label] not in (None, ""):
         return row[label]
     vals = row.get("_values", [])
     return vals[index] if index is not None and len(vals) > index else ""

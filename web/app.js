@@ -2,8 +2,9 @@ const $=s=>document.querySelector(s);let data=null,view='overview',toastTimer;
 const money=(x,c='USD',digits=2)=>`${c} ${new Intl.NumberFormat('en-US',{minimumFractionDigits:digits,maximumFractionDigits:digits}).format(Number(x)||0)}`;
 const signed=(x,c='USD')=>{const n=Number(x)||0;return `<span class="${n>0?'positive':n<0?'negative':''}">${n>0?'+':''}${money(n,c)}</span>`};
 const esc=x=>String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const num=(row,key,i)=>Number((row?.[key]??row?._values?.[i]??'0').toString().replace(/,/g,''))||0;
-const val=(row,key,i)=>row?.[key]??row?._values?.[i]??'';
+const field=(row,key,i)=>row?.[key]!==undefined&&row?.[key]!==null&&row?.[key]!==''?row[key]:row?._values?.[i]??'';
+const num=(row,key,i)=>Number(String(field(row,key,i)||'0').replace(/,/g,''))||0;
+const val=field;
 const fmtDate=d=>{if(!d)return '—';const m=String(d).match(/\d{4}-\d{2}-\d{2}/);return m?m[0]:d};
 const pct=(x,total)=>total?Math.max(0,Math.min(100,x/total*100)):0;
 function showToast(s){const t=$('#toast');t.textContent=s;t.classList.add('show');clearTimeout(toastTimer);toastTimer=setTimeout(()=>t.classList.remove('show'),2800)}
