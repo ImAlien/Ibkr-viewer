@@ -255,6 +255,7 @@ def parse_flex_csv(content):
                     continue
                 payload = {"货币": currency, "日期": date_value, "结算日期": date_value,
                            "描述": description, "金额": amount, "交易时间": row.get("Date/Time", "")}
+                payload["_source"] = "CashTransactions"
                 payload["_values"] = [currency, date_value, description, amount]
                 event_groups[section].append(payload)
         elif {"Received", "Paid", "Total", "CurrencyPrimary", "ActivityDescription"}.issubset(fields):
@@ -273,12 +274,6 @@ def parse_flex_csv(content):
             for row in block_data:
                 currency = row.get("CurrencyPrimary", "")
                 payload = {"货币": currency, "日期": flex_date(row.get("Date", "")), "描述": row.get("Description", ""), "金额": row.get("Amount", "")}
-                payload["_values"] = [currency, payload["日期"], payload["描述"], payload["金额"]]
-                event_groups["利息"].append(payload)
-        elif {"ValueDate", "InterestType", "TotalInterest", "CurrencyPrimary"}.issubset(fields):
-            for row in block_data:
-                currency = row.get("CurrencyPrimary", "")
-                payload = {"货币": currency, "日期": flex_date(row.get("ValueDate", "")), "描述": row.get("InterestType", ""), "金额": row.get("TotalInterest", "")}
                 payload["_values"] = [currency, payload["日期"], payload["描述"], payload["金额"]]
                 event_groups["利息"].append(payload)
         elif {"TradeDate", "DateTime", "Buy/Sell", "Quantity", "TradePrice", "CurrencyPrimary"}.issubset(fields):
@@ -318,6 +313,9 @@ def parse_flex_csv(content):
                    if name.startswith("Flex:") and {"DateTime", "FXCurrency", "ActivityDescription",
                                                       "Quantity", "Proceeds", "FunctionalCurrency"}.issubset(payload)]
     derive_flex_cashflow_base_amounts(event_groups["存款和取款"], fx_activity, base_currency)
+    cash_activity = [payload for name, _, payload in normalized
+                     if name.startswith("Flex:") and {"Date", "ActivityDescription", "Amount", "CurrencyPrimary"}.issubset(payload)]
+    derive_flex_interest_base_amounts(event_groups["利息"], cash_activity, base_currency, base_interest)
     for section, events in event_groups.items():
         by_currency = {}
         for event in events:
@@ -585,6 +583,60 @@ def derive_flex_cashflow_base_amounts(events, activity_rows, base_currency):
             unmatched.discard(index)
 
 
+def derive_flex_interest_base_amounts(events, activity_rows, base_currency, report_total):
+    """Value posted interest transactions in base currency without adding daily accrual rows."""
+    def date_key(value):
+        value = str(value or "").strip()
+        digits = re.sub(r"\D", "", value)
+        return digits[:8] if len(digits) >= 8 else value[:10]
+
+    def signature(description):
+        text = re.sub(r"\s+", " ", str(description or "").upper()).strip()
+        match = re.search(r"\b([A-Z]{3})\s+(CREDIT|DEBIT)\s+INT(?:EREST)?\s+FOR\s+([A-Z]{3,9}-\d{4})\b", text)
+        return match.groups() if match else None
+
+    translated = {}
+    for row in activity_rows:
+        if row.get("CurrencyPrimary") != base_currency:
+            continue
+        key_signature = signature(row.get("ActivityDescription"))
+        key_date = date_key(row.get("Date"))
+        if key_signature and key_date:
+            translated.setdefault((key_date, key_signature), []).append(n(row.get("Amount")))
+
+    unmatched = []
+    for event in events:
+        amount = n(event.get("金额"))
+        currency = event.get("货币", "")
+        if currency == base_currency:
+            event["基础货币金额"] = str(amount)
+            continue
+        event_signature = signature(event.get("描述"))
+        key = (date_key(event.get("交易时间") or event.get("日期")), event_signature)
+        candidates = translated.get(key) if event_signature else None
+        if candidates:
+            event["基础货币金额"] = str(candidates.pop(0))
+        else:
+            unmatched.append(event)
+
+    if report_total is None or not events:
+        return
+    known_total = sum(n(event.get("基础货币金额")) for event in events
+                      if event.get("基础货币金额") not in (None, ""))
+    residual = n(report_total) - known_total
+    if unmatched:
+        denominator = sum(n(event.get("金额")) for event in unmatched)
+        absolute_denominator = sum(abs(n(event.get("金额"))) for event in unmatched)
+        for event in unmatched:
+            amount = n(event.get("金额"))
+            weight = amount / denominator if abs(denominator) > 1e-12 else abs(amount) / (absolute_denominator or 1)
+            event["基础货币金额"] = str(residual * weight)
+    elif abs(residual) > 1e-9:
+        # Keep the sum aligned with IBKR's report total if the activity detail is incomplete.
+        last = events[-1]
+        last["基础货币金额"] = str(n(last.get("基础货币金额")) + residual)
+
+
 def v(row, label, index=None):
     if label in row and row[label] not in (None, ""):
         return row[label]
@@ -734,6 +786,11 @@ def summary(db, account=None, date_from=None, date_to=None):
                                   "period": imp["period_end"]})
         for section, target in (("股息", dividends), ("代扣税", tax), ("利息", interest)):
             records = imported_section(db, imp, section)
+            if section == "利息":
+                flex_cash_transactions = [r for r in records
+                                          if r.get("_source") == "CashTransactions" or r.get("交易时间")]
+                if flex_cash_transactions:
+                    records = flex_cash_transactions
             section_fx_rates = cashflow_fx_rates(records, imp.get("base_currency") or "USD")
             for r in records:
                 amount = v(r, "金额", 3)
@@ -741,7 +798,8 @@ def summary(db, account=None, date_from=None, date_to=None):
                 if amount and not is_summary_currency(currency):
                     target.append({"date": v(r, "日期", 1), "currency": currency,
                                    "description": v(r, "描述", 2), "amount": n(amount),
-                                   "_base_amount": n(amount) * section_fx_rates.get(currency, 1 if currency == (imp.get("base_currency") or "USD") else 0),
+                                   "_base_amount": (n(r["基础货币金额"]) if r.get("基础货币金额") not in (None, "") else
+                                                    n(amount) * section_fx_rates.get(currency, 1 if currency == (imp.get("base_currency") or "USD") else 0)),
                                    "period": imp["period_end"]})
     # Remove exact overlap rows while retaining legitimate identical occurrences from a single statement.
     def dedupe(events, event_kind=""):
