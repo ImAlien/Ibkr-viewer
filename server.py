@@ -8,7 +8,7 @@ import os
 import re
 import sqlite3
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import date, datetime
 from email.parser import BytesParser
 from email.policy import default
@@ -214,9 +214,10 @@ def parse_flex_csv(content):
                 normalized.append(("已实现和未实现的表现总结", payload["代码"], payload))
         elif {"ReportDate", "TransactionMtmPnl", "PriorOpenMtmPnl", "Total"}.issubset(fields):
             for row in block_data:
-                payload = {"报告日期": row.get("ReportDate", ""), "代码": row.get("Symbol", ""),
-                           "按市值计算的损益": row.get("Total", ""), "总数": row.get("Total", "")}
-                payload["_values"] = [payload["代码"], payload["按市值计算的损益"]]
+                payload = {"报告日期": row.get("ReportDate", ""), "资产分类": row.get("AssetClass", ""),
+                           "代码": row.get("Symbol", ""), "按市值计算的损益": row.get("Total", ""),
+                           "总数": row.get("Total", "")}
+                payload["_values"] = [payload["资产分类"], payload["代码"], payload["按市值计算的损益"]]
                 normalized.append(("按市值计算的表现总结", payload["报告日期"], payload))
         elif {"PositionValue", "CostBasisMoney", "FifoPnlUnrealized", "CurrencyPrimary"}.issubset(fields):
             for row in block_data:
@@ -766,9 +767,6 @@ def summary(db, account=None, date_from=None, date_to=None):
     position_records = [r for r in imported_section(db, latest, "未平仓持仓")
                         if v(r, "DataDiscriminator", 0) == "Summary"] if latest else []
     positions = merge_positions(position_records)
-    realized = unpack(db, iid, "已实现和未实现的表现总结")
-    realized_total = next((r for r in realized if v(r, "资产分类", 0) in ("总数", "Total")), None)
-    pnl_change = unpack(db, iid, "净资产值变更")
     cashflows = []
     dividends, tax, interest = [], [], []
     for imp in selected:
@@ -829,25 +827,11 @@ def summary(db, account=None, date_from=None, date_to=None):
     cashflows = dedupe(cashflows, "cashflow")
     dividends = dedupe(dividends, "dividend")
     tax, interest = map(dedupe, (tax, interest))
+    all_cashflows = cashflows
     def in_range(event):
         return (not date_from or not event["date"] or event["date"] >= date_from) and (not date_to or not event["date"] or event["date"] <= date_to)
     cashflows, dividends, tax, interest = ([e for e in events if in_range(e)]
                                            for events in (cashflows, dividends, tax, interest))
-    # Sum realized/unrealized report totals across non-overlapping statement periods in the selected range.
-    realized_pnl = 0
-    covered_until = ""
-    for imp in selected:
-        period_start, period_end = imp["period_start"], imp["period_end"]
-        if not period_end or (date_from and period_end < date_from) or (date_to and period_end > date_to):
-            continue
-        if covered_until and period_start and period_start < covered_until:
-            continue
-        period_rows = unpack(db, imp["id"], "已实现和未实现的表现总结")
-        period_total = next((r for r in period_rows if v(r, "资产分类", 0) in ("总数", "Total")), None)
-        if period_total:
-            realized_pnl += n(v(period_total, "总数", 13))
-        covered_until = max(covered_until, period_end)
-    report_change = next((n(v(r, "域值", 1)) for r in pnl_change if v(r, "域名称", 0) == "按市值计价"), 0)
     # Convert each currency using IBKR's translated subtotals; detail rows retain their original currency.
     net_flows = sum(e["_base_amount"] for e in cashflows)
     deposit_total = net_flows
@@ -857,20 +841,6 @@ def summary(db, account=None, date_from=None, date_to=None):
     nlv_value = n(v(nav_total, "当前合计", 4)) if nav_total else 0
     cash_value = n(v(nav_cash, "当前合计", 4)) if nav_cash else 0
     equity_value = n(v(nav_equity, "当前合计", 4)) if nav_equity else 0
-    monthly = []
-    for imp in selected:
-        if date_from and imp["period_end"] and imp["period_end"] < date_from:
-            continue
-        if date_to and imp["period_end"] and imp["period_end"] > date_to:
-            continue
-        changes = unpack(db, imp["id"], "净资产值变更")
-        end = next((n(v(r, "域值", 1)) for r in changes if v(r, "域名称", 0) == "结束价值"), None)
-        start = next((n(v(r, "域值", 1)) for r in changes if v(r, "域名称", 0) == "开始价值"), None)
-        flows = next((n(v(r, "域值", 1)) for r in changes if v(r, "域名称", 0) == "存款和取款"), None)
-        period_pnl = (end - start - flows) if start is not None and end is not None and flows is not None else 0
-        monthly.append({"period": f"{imp['period_start']} – {imp['period_end']}", "pnl": period_pnl,
-                        "start": start, "end": end, "flows": flows or 0,
-                        "start_date": imp["period_start"], "end_date": imp["period_end"]})
     nav_points = []
     for imp in selected:
         daily_nav = [r for r in unpack(db, imp["id"], "净资产值")
@@ -893,6 +863,83 @@ def summary(db, account=None, date_from=None, date_to=None):
             nav_points.append({"date": start_date, "value": start})
         if end is not None and end_date and (not nav_points or end_date > nav_points[-1]["date"]):
             nav_points.append({"date": end_date, "value": end})
+    nav_points.sort(key=lambda point: point["date"])
+    nav_dates = [point["date"] for point in nav_points]
+    flows_by_index = defaultdict(float)
+    for event in all_cashflows:
+        if not event["date"] or len(nav_points) < 2:
+            continue
+        index = next((i for i, point in enumerate(nav_points) if point["date"] >= event["date"]), None)
+        if index == 0:
+            index = 1
+        if index is not None and index < len(nav_points):
+            flows_by_index[index] += event["_base_amount"]
+    daily_points = []
+    for index in range(1, len(nav_points)):
+        point = nav_points[index]
+        daily_points.append({"date": point["date"], "value": point["value"],
+                             "external_flows": flows_by_index[index],
+                             "pnl": point["value"] - nav_points[index - 1]["value"] - flows_by_index[index]})
+
+    # Reconcile daily changes to IBKR's exact cash-flow-adjusted totals for complete report periods.
+    covered_until = ""
+    for imp in selected:
+        period_start, period_end = imp["period_start"], imp["period_end"]
+        if not period_start or not period_end or (covered_until and period_start <= covered_until):
+            continue
+        changes = unpack(db, imp["id"], "净资产值变更")
+        start_value = next((n(v(r, "域值", 1)) for r in changes if v(r, "域名称", 0) == "开始价值"), None)
+        end_value = next((n(v(r, "域值", 1)) for r in changes if v(r, "域名称", 0) == "结束价值"), None)
+        report_flows = next((n(v(r, "域值", 1)) for r in changes if v(r, "域名称", 0) == "存款和取款"), None)
+        period_points = [point for point in daily_points if period_start <= point["date"] <= period_end]
+        if start_value is not None and end_value is not None and report_flows is not None and period_points:
+            difference = end_value - start_value - report_flows - sum(point["pnl"] for point in period_points)
+            period_points[0]["pnl"] += difference
+            period_points[0]["reconciliation"] = difference
+        covered_until = period_end
+
+    selected_daily = [point.copy() for point in daily_points
+                      if (not date_from or point["date"] >= date_from) and (not date_to or point["date"] <= date_to)]
+    range_pnl = sum(point["pnl"] for point in selected_daily)
+    range_net_asset_change = 0
+    if selected_daily:
+        first_date = selected_daily[0]["date"]
+        first_index = nav_dates.index(first_date)
+        range_net_asset_change = selected_daily[-1]["value"] - nav_points[max(0, first_index - 1)]["value"]
+
+    monthly_totals = defaultdict(lambda: {"pnl": 0.0, "external_flows": 0.0, "trading_days": 0})
+    for point in selected_daily:
+        month = point["date"][:7]
+        monthly_totals[month]["pnl"] += point["pnl"]
+        monthly_totals[month]["external_flows"] += point["external_flows"]
+        monthly_totals[month]["trading_days"] += 1
+    monthly = [{"month": month, **values} for month, values in sorted(monthly_totals.items())]
+
+    # IBKR's MTMPerformanceSummary carries per-security totals at report-period granularity.
+    stock_totals = defaultdict(float)
+    stock_covered_until = ""
+    partial_stock_periods = []
+    for imp in selected:
+        period_start, period_end = imp["period_start"], imp["period_end"]
+        if not period_start or not period_end:
+            continue
+        if (date_from and period_start < date_from) or (date_to and period_end > date_to):
+            if (not date_to or period_start <= date_to) and (not date_from or period_end >= date_from):
+                partial_stock_periods.append(f"{period_start} – {period_end}")
+            continue
+        if stock_covered_until and period_start <= stock_covered_until:
+            continue
+        for row in imported_section(db, imp, "按市值计算的表现总结"):
+            if v(row, "资产分类", 0) != "STK" or not v(row, "代码", 1):
+                continue
+            stock_totals[v(row, "代码", 1)] += n(v(row, "按市值计算的损益", 2))
+        stock_covered_until = period_end
+    pnl_assets = [{"asset": "STK", "symbol": symbol, "realized": None, "unrealized": None,
+                   "total": total, "currency": base_currency}
+                  for symbol, total in sorted(stock_totals.items(), key=lambda item: abs(item[1]), reverse=True)]
+    pnl_assets_note = ("个股盈亏使用 IBKR MTMPerformanceSummary 的基础货币值，仅显示完整落入所选日期的 Flex 报告；"
+                       "部分报告区间暂不拆分。" if partial_stock_periods else
+                       "个股区间盈亏按 IBKR MTMPerformanceSummary 的基础货币值统计；不含现金利息与股息。")
     prior_nav_point = next((p for p in reversed(nav_points) if date_from and p["date"] < date_from), None)
     nav_history = ([prior_nav_point] if prior_nav_point else []) + [
         p for p in nav_points if (not date_from or p["date"] >= date_from) and (not date_to or p["date"] <= date_to)]
@@ -912,12 +959,6 @@ def summary(db, account=None, date_from=None, date_to=None):
                            "price": n(v(r, "交易价格", 6)), "proceeds": n(v(r, "收益", 8)),
                            "realized": n(v(r, "已实现的损益", 11)), "mtm": n(v(r, "按市值计算的损益", 12)),
                            "side": v(r, "买卖", 13)})
-    pnl_assets = []
-    for r in realized:
-        asset = v(r, "资产分类", 0)
-        if asset and asset not in ("总数", "Total") and v(r, "代码", 1):
-            pnl_assets.append({"asset": asset, "symbol": v(r, "代码", 1), "realized": n(v(r, "已实现的 总数", 7)),
-                               "unrealized": n(v(r, "未实现的 总数", 12)), "total": n(v(r, "总数", 13))})
     for events in (cashflows, dividends, tax, interest):
         for event in events:
             event.pop("_base_amount", None)
@@ -925,11 +966,12 @@ def summary(db, account=None, date_from=None, date_to=None):
             "imports": selected, "base_currency": base_currency,
             "range": {"start": date_from, "end": date_to, "min": first_date, "max": last_date},
             "kpis": {"net_liquidation": nlv_value, "cash": cash_value, "stocks": equity_value,
-                     "period_realized_unrealized": realized_pnl, "period_mtm": report_change,
+                     "period_realized_unrealized": range_pnl, "period_mtm": range_net_asset_change,
                      "deposits_withdrawals": deposit_total,
                      "dividends": base_dividends, "withholding_tax": base_tax,
                      "interest": base_interest},
-            "positions": positions, "pnl_assets": pnl_assets, "history": monthly, "nav_history": nav_history,
+            "positions": positions, "pnl_assets": pnl_assets, "pnl_assets_note": pnl_assets_note,
+            "history": monthly, "monthly_pnl": monthly, "daily_pnl": selected_daily, "nav_history": nav_history,
             "cashflows": recent_cashflows, "dividends_detail": recent_dividends,
             "tax_detail": recent_tax, "interest_detail": recent_interest,
             "trades": sorted(trade_rows, key=lambda e: e["date"], reverse=True)[:200]}
