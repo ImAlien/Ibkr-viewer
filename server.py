@@ -908,15 +908,22 @@ def summary(db, account=None, date_from=None, date_to=None):
         range_net_asset_change = selected_daily[-1]["value"] - nav_points[max(0, first_index - 1)]["value"]
 
     monthly_totals = defaultdict(lambda: {"pnl": 0.0, "external_flows": 0.0, "trading_days": 0})
+    yearly_totals = defaultdict(lambda: {"pnl": 0.0, "external_flows": 0.0, "trading_days": 0})
     for point in selected_daily:
         month = point["date"][:7]
         monthly_totals[month]["pnl"] += point["pnl"]
         monthly_totals[month]["external_flows"] += point["external_flows"]
         monthly_totals[month]["trading_days"] += 1
+        year = point["date"][:4]
+        yearly_totals[year]["pnl"] += point["pnl"]
+        yearly_totals[year]["external_flows"] += point["external_flows"]
+        yearly_totals[year]["trading_days"] += 1
     monthly = [{"month": month, **values} for month, values in sorted(monthly_totals.items())]
+    yearly = [{"year": year, **values} for year, values in sorted(yearly_totals.items())]
 
     # IBKR's MTMPerformanceSummary carries per-security totals at report-period granularity.
-    stock_totals = defaultdict(float)
+    security_totals = defaultdict(float)
+    covered_stock_imports = []
     stock_covered_until = ""
     partial_stock_periods = []
     for imp in selected:
@@ -929,17 +936,123 @@ def summary(db, account=None, date_from=None, date_to=None):
             continue
         if stock_covered_until and period_start <= stock_covered_until:
             continue
+        covered_stock_imports.append(imp)
         for row in imported_section(db, imp, "按市值计算的表现总结"):
-            if v(row, "资产分类", 0) != "STK" or not v(row, "代码", 1):
+            asset = v(row, "资产分类", 0)
+            symbol = v(row, "代码", 1)
+            if asset not in ("STK", "OPT") or not symbol:
                 continue
-            stock_totals[v(row, "代码", 1)] += n(v(row, "按市值计算的损益", 2))
+            security_totals[(asset, symbol)] += n(v(row, "按市值计算的损益", 2))
         stock_covered_until = period_end
-    pnl_assets = [{"asset": "STK", "symbol": symbol, "realized": None, "unrealized": None,
-                   "total": total, "currency": base_currency}
-                  for symbol, total in sorted(stock_totals.items(), key=lambda item: abs(item[1]), reverse=True)]
-    pnl_assets_note = ("个股盈亏使用 IBKR MTMPerformanceSummary 的基础货币值，仅显示完整落入所选日期的 Flex 报告；"
+
+    contract_underlyings = {}
+    root_underlyings = {}
+    stock_descriptions = {}
+    for imp in covered_stock_imports:
+        sections = [row[0] for row in db.execute("SELECT DISTINCT section FROM records WHERE import_id=?", (imp["id"],))]
+        for section in sections:
+            if not section.startswith("Flex:"):
+                continue
+            for row in unpack(db, imp["id"], section):
+                symbol = str(row.get("Symbol", "") or "").strip()
+                underlying = str(row.get("UnderlyingSymbol", "") or "").strip()
+                asset = str(row.get("AssetClass", "") or "").strip()
+                if asset == "STK" and symbol and row.get("Description"):
+                    stock_descriptions[symbol] = row["Description"]
+                if asset == "OPT" and symbol:
+                    description_root = str(row.get("Description", "") or "").strip().split()
+                    if description_root:
+                        contract_underlyings[symbol] = description_root[0]
+                        root_underlyings[symbol.split()[0]] = description_root[0]
+                if symbol and underlying and symbol != underlying:
+                    contract_underlyings[symbol] = underlying
+                    root_underlyings[symbol.split()[0]] = underlying
+
+    def underlying_for(asset, symbol):
+        if asset == "STK":
+            return symbol
+        if symbol in contract_underlyings:
+            return contract_underlyings[symbol]
+        root = symbol.split()[0] if symbol.split() else symbol
+        return root_underlyings.get(root, root)
+
+    pnl_groups = {}
+    for (asset, symbol), total in security_totals.items():
+        underlying = underlying_for(asset, symbol)
+        group = pnl_groups.setdefault(underlying, {"underlying": underlying, "description": stock_descriptions.get(underlying, ""),
+                                                   "stock_pnl": 0.0, "option_pnl": 0.0, "total": 0.0,
+                                                   "securities": [], "trades": []})
+        group["stock_pnl" if asset == "STK" else "option_pnl"] += total
+        group["total"] += total
+        group["securities"].append({"asset": asset, "symbol": symbol, "total": total})
+
+    # Use actual execution rows with proceeds to avoid repeating FIFO lot-allocation rows.
+    pnl_trades = defaultdict(list)
+    seen_trade_counts = {}
+    for imp in covered_stock_imports:
+        local_counts = Counter()
+        for row in unpack(db, imp["id"], "交易"):
+            asset = v(row, "资产分类", 1)
+            symbol = str(v(row, "代码", 3) or "").strip()
+            raw_date = str(v(row, "日期/时间", 4) or "")
+            match = re.match(r"(\d{8})", raw_date)
+            if asset not in ("STK", "OPT") or not symbol or not match or v(row, "收益", 8) in (None, ""):
+                continue
+            trade_date = datetime.strptime(match.group(1), "%Y%m%d").strftime("%Y-%m-%d")
+            if (date_from and trade_date < date_from) or (date_to and trade_date > date_to):
+                continue
+            currency = v(row, "货币", 2)
+            quantity = n(v(row, "数量", 5))
+            price = n(v(row, "交易价格", 6))
+            proceeds = n(v(row, "收益", 8))
+            realized = n(v(row, "已实现的损益", 11))
+            side = v(row, "买卖", 13)
+            signature = (trade_date, raw_date, asset, symbol, side, quantity, price, proceeds, realized, currency)
+            local_counts[signature] += 1
+            if local_counts[signature] <= seen_trade_counts.get(signature, 0):
+                continue
+            underlying = underlying_for(asset, symbol)
+            pnl_groups.setdefault(underlying, {"underlying": underlying, "description": stock_descriptions.get(underlying, ""),
+                                               "stock_pnl": 0.0, "option_pnl": 0.0, "total": 0.0,
+                                               "securities": [], "trades": []})
+            pnl_trades[underlying].append({"date": trade_date, "asset": asset, "symbol": symbol,
+                                           "action": side, "quantity": quantity, "price": price,
+                                           "currency": currency, "realized": realized})
+        for signature, count in local_counts.items():
+            seen_trade_counts[signature] = max(seen_trade_counts.get(signature, 0), count)
+
+        section_names = [row[0] for row in db.execute("SELECT DISTINCT section FROM records WHERE import_id=?", (imp["id"],))]
+        for section in section_names:
+            if not section.startswith("Flex:") or "UnderlyingSymbol" not in section:
+                continue
+            for row in unpack(db, imp["id"], section):
+                symbol = str(row.get("Symbol", "") or "").strip()
+                underlying = str(row.get("UnderlyingSymbol", "") or "").strip()
+                if not symbol or not underlying or symbol == underlying or not row.get("Expiry"):
+                    continue
+                raw_date = str(row.get("Date", "") or "")
+                if not re.fullmatch(r"\d{8}", raw_date):
+                    continue
+                trade_date = datetime.strptime(raw_date, "%Y%m%d").strftime("%Y-%m-%d")
+                if (date_from and trade_date < date_from) or (date_to and trade_date > date_to):
+                    continue
+                pnl_groups.setdefault(underlying, {"underlying": underlying, "description": stock_descriptions.get(underlying, ""),
+                                                   "stock_pnl": 0.0, "option_pnl": 0.0, "total": 0.0,
+                                                   "securities": [], "trades": []})
+                pnl_trades[underlying].append({"date": trade_date, "asset": "OPT", "symbol": symbol,
+                                               "action": row.get("Transaction Type", ""), "quantity": n(row.get("Quantity")),
+                                               "price": n(row.get("Trade Price")), "currency": row.get("CurrencyPrimary", ""),
+                                               "realized": n(row.get("RealizedPnl"))})
+
+    pnl_assets = []
+    for underlying, group in pnl_groups.items():
+        group["securities"].sort(key=lambda row: abs(row["total"]), reverse=True)
+        group["trades"] = sorted(pnl_trades.get(underlying, []), key=lambda row: row["date"], reverse=True)
+        pnl_assets.append(group)
+    pnl_assets.sort(key=lambda group: abs(group["total"]), reverse=True)
+    pnl_assets_note = ("股票和期权盈亏使用 IBKR MTMPerformanceSummary 的基础货币值，仅显示完整落入所选日期的 Flex 报告；"
                        "部分报告区间暂不拆分。" if partial_stock_periods else
-                       "个股区间盈亏按 IBKR MTMPerformanceSummary 的基础货币值统计；不含现金利息与股息。")
+                       "期权已按 IBKR 提供的 UnderlyingSymbol / 合约描述并入对应股票。汇总使用基础货币的 MTM 盈亏；展开明细显示逐笔已实现盈亏（成交币种），未实现盈亏保留在证券汇总中。")
     prior_nav_point = next((p for p in reversed(nav_points) if date_from and p["date"] < date_from), None)
     nav_history = ([prior_nav_point] if prior_nav_point else []) + [
         p for p in nav_points if (not date_from or p["date"] >= date_from) and (not date_to or p["date"] <= date_to)]
@@ -971,7 +1084,8 @@ def summary(db, account=None, date_from=None, date_to=None):
                      "dividends": base_dividends, "withholding_tax": base_tax,
                      "interest": base_interest},
             "positions": positions, "pnl_assets": pnl_assets, "pnl_assets_note": pnl_assets_note,
-            "history": monthly, "monthly_pnl": monthly, "daily_pnl": selected_daily, "nav_history": nav_history,
+            "history": monthly, "monthly_pnl": monthly, "yearly_pnl": yearly,
+            "daily_pnl": selected_daily, "nav_history": nav_history,
             "cashflows": recent_cashflows, "dividends_detail": recent_dividends,
             "tax_detail": recent_tax, "interest_detail": recent_interest,
             "trades": sorted(trade_rows, key=lambda e: e["date"], reverse=True)[:200]}
