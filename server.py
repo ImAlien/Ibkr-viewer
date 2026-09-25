@@ -978,6 +978,33 @@ def summary(db, account=None, date_from=None, date_to=None):
     nlv_value = n(v(nav_total, "当前合计", 4)) if nav_total else 0
     cash_value = n(v(nav_cash, "当前合计", 4)) if nav_cash else 0
     equity_value = n(v(nav_equity, "当前合计", 4)) if nav_equity else 0
+    # Use one valuation date for every category; short option liabilities must
+    # retain their sign instead of being folded into a clipped residual.
+    allocation_rows = [row for (asset, day), row in daily_nav_by_key.items()
+                       if day == nav_as_of.replace("-", "") and asset != "总数"]
+    if not allocation_rows:
+        allocation_rows = [row for row in nlv if v(row, "资产类型", 0) != "总数"]
+    allocation_groups = {}
+    for row in allocation_rows:
+        name = str(v(row, "资产类型", 0))
+        if not name:
+            continue
+        name = "期权" if "期权" in name else name
+        item = allocation_groups.setdefault(name, {"name": name, "value": 0.0,
+                                                    "long_value": None, "short_value": None})
+        item["value"] += n(v(row, "当前合计", 4))
+        for key, label, index in (("long_value", "当前多头", 2), ("short_value", "当前空头", 3)):
+            value = v(row, label, index)
+            if value not in (None, ""):
+                item[key] = (item[key] or 0.0) + n(value)
+    allocation = [allocation_groups.pop(name, {"name": name, "value": 0.0,
+                                               "long_value": None, "short_value": None})
+                  for name in ("股票", "期权", "现金")]
+    allocation.extend(item for item in allocation_groups.values() if item["value"] != 0)
+    residual = nlv_value - sum(item["value"] for item in allocation)
+    if abs(residual) > 0.005:
+        allocation.append({"name": "其他净额", "value": residual,
+                           "note": "净清算价值与已列资产项目的差额"})
     nav_by_date = {}
     for imp in selected:
         daily_nav = [r for r in unpack(db, imp["id"], "净资产值")
@@ -1223,7 +1250,7 @@ def summary(db, account=None, date_from=None, date_to=None):
                      "dividends": base_dividends, "withholding_tax": base_tax,
                      "trading_taxes": base_trading_taxes, "commissions": base_commissions,
                      "interest": base_interest},
-            "positions": positions, "pnl_assets": pnl_assets, "pnl_assets_note": pnl_assets_note,
+            "positions": positions, "allocation": allocation, "pnl_assets": pnl_assets, "pnl_assets_note": pnl_assets_note,
             "history": monthly, "monthly_pnl": monthly, "yearly_pnl": yearly,
             "daily_pnl": selected_daily, "nav_history": nav_history, "twr_history": twr_history,
             "cashflows": recent_cashflows, "dividends_detail": recent_dividends,
