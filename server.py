@@ -9,7 +9,7 @@ import re
 import sqlite3
 import time
 from collections import Counter, defaultdict
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from email.parser import BytesParser
 from email.policy import default
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -113,6 +113,12 @@ def parse_csv(content):
             "records": data_records}
 
 
+def tax_event_section(description):
+    text = re.sub(r"\s+", " ", str(description or "")).casefold()
+    transaction_tax_terms = ("transaction levy", "transaction tax", "stamp tax", "stamp duty")
+    return "交易税费" if any(term in text for term in transaction_tax_terms) else "代扣税"
+
+
 def parse_flex_csv(content):
     text = None
     for encoding in ("utf-8-sig", "utf-8", "gb18030"):
@@ -147,8 +153,9 @@ def parse_flex_csv(content):
 
     def flex_date(value):
         value = str(value or "").strip()
-        if re.fullmatch(r"\d{8}", value):
-            return datetime.strptime(value, "%Y%m%d").strftime("%Y-%m-%d")
+        match = re.match(r"^(\d{8})(?:;|$)", value)
+        if match:
+            return datetime.strptime(match.group(1), "%Y%m%d").strftime("%Y-%m-%d")
         return value
 
     account = ""
@@ -156,7 +163,7 @@ def parse_flex_csv(content):
     start_date = end_date = ""
     generated = datetime.now().astimezone().isoformat(timespec="seconds")
     normalized = []
-    event_groups = {"存款和取款": [], "股息": [], "代扣税": [], "利息": []}
+    event_groups = {"存款和取款": [], "股息": [], "代扣税": [], "交易税费": [], "手续费": [], "利息": []}
     base_flow = base_dividends = base_interest = None
     nav_rows = []
     for block_header, block_rows in blocks:
@@ -244,7 +251,7 @@ def parse_flex_csv(content):
                 elif "interest" in activity_type:
                     section = "利息"
                 elif "tax" in activity_type:
-                    section = "代扣税"
+                    section = tax_event_section(description)
                 elif "deposit" in activity_type or "withdraw" in activity_type:
                     section = "存款和取款"
                 else:
@@ -268,9 +275,12 @@ def parse_flex_csv(content):
         elif {"TaxDescription", "TaxAmount", "CurrencyPrimary"}.issubset(fields):
             for row in block_data:
                 currency = row.get("CurrencyPrimary", "")
-                payload = {"货币": currency, "日期": flex_date(row.get("Date", "")), "描述": row.get("TaxDescription", ""), "金额": row.get("TaxAmount", "")}
+                raw_date = row.get("Date", "")
+                description = row.get("TaxDescription", "")
+                payload = {"货币": currency, "日期": flex_date(raw_date), "交易时间": raw_date,
+                           "描述": description, "金额": row.get("TaxAmount", "")}
                 payload["_values"] = [currency, payload["日期"], payload["描述"], payload["金额"]]
-                event_groups["代扣税"].append(payload)
+                event_groups[tax_event_section(description)].append(payload)
         elif {"Date", "Description", "Amount", "CurrencyPrimary"}.issubset(fields):
             for row in block_data:
                 currency = row.get("CurrencyPrimary", "")
@@ -279,15 +289,27 @@ def parse_flex_csv(content):
                 event_groups["利息"].append(payload)
         elif {"TradeDate", "DateTime", "Buy/Sell", "Quantity", "TradePrice", "CurrencyPrimary"}.issubset(fields):
             for row in block_data:
+                trade_datetime = row.get("DateTime", row.get("TradeDate", ""))
+                currency = row.get("CurrencyPrimary", "")
+                symbol = row.get("Symbol", "")
+                commission = row.get("IBCommission", "")
                 payload = {"DataDiscriminator": "Trade", "资产分类": row.get("AssetClass", ""),
-                           "货币": row.get("CurrencyPrimary", ""), "代码": row.get("Symbol", ""),
-                           "日期/时间": row.get("DateTime", row.get("TradeDate", "")), "数量": row.get("Quantity", ""),
+                           "货币": currency, "代码": symbol,
+                           "日期/时间": trade_datetime, "数量": row.get("Quantity", ""),
                            "交易价格": row.get("TradePrice", ""), "收益": row.get("Proceeds", ""),
                            "已实现的损益": row.get("FifoPnlRealized", ""), "按市值计算的损益": "",
-                           "买卖": row.get("Buy/Sell", "")}
+                           "买卖": row.get("Buy/Sell", ""), "佣金": commission}
                 payload["_values"] = ["Trade", payload["资产分类"], payload["货币"], payload["代码"], payload["日期/时间"],
-                                      payload["数量"], payload["交易价格"], "", payload["收益"], "", "", payload["已实现的损益"]]
+                                      payload["数量"], payload["交易价格"], "", payload["收益"], "", "", payload["已实现的损益"],
+                                      payload["按市值计算的损益"], payload["买卖"], commission]
                 normalized.append(("交易", payload["代码"], payload))
+                if commission not in (None, "") and n(commission):
+                    asset = row.get("AssetClass", "")
+                    fee = {"货币": currency, "日期": flex_date(row.get("TradeDate") or trade_datetime),
+                           "交易时间": trade_datetime, "描述": f"{symbol} {asset} commission".strip(),
+                           "金额": commission, "_source": "TradeCommission"}
+                    fee["_values"] = [currency, fee["日期"], fee["描述"], commission]
+                    event_groups["手续费"].append(fee)
         else:
             section = "Flex:" + ",".join(block_header[:6])
             for row in block_data:
@@ -314,6 +336,8 @@ def parse_flex_csv(content):
                    if name.startswith("Flex:") and {"DateTime", "FXCurrency", "ActivityDescription",
                                                       "Quantity", "Proceeds", "FunctionalCurrency"}.issubset(payload)]
     derive_flex_cashflow_base_amounts(event_groups["存款和取款"], fx_activity, base_currency)
+    derive_flex_transaction_base_amounts(
+        event_groups["手续费"] + event_groups["交易税费"] + event_groups["代扣税"], fx_activity, base_currency)
     cash_activity = [payload for name, _, payload in normalized
                      if name.startswith("Flex:") and {"Date", "ActivityDescription", "Amount", "CurrencyPrimary"}.issubset(payload)]
     derive_flex_interest_base_amounts(event_groups["利息"], cash_activity, base_currency, base_interest)
@@ -478,6 +502,26 @@ def fetch_flex_report(date_from, date_to):
     return {"report_file": filename, "import": result}
 
 
+def update_flex_report(account=None):
+    account = str(account or "").strip() or None
+    with connect() as db:
+        imports = all_imports(db, account)
+    if not imports:
+        raise ValueError("当前账本还没有导入记录，先导入一份 Flex 报表。")
+    if account is None:
+        account = max(imports, key=lambda item: item.get("period_end") or "").get("account")
+        imports = [item for item in imports if item["account"] == account]
+    last_day = max((item.get("period_end") or "" for item in imports), default="")
+    if not last_day:
+        raise ValueError("账本没有可用的最后报告日期。")
+    yesterday = (datetime.now().astimezone().date() - timedelta(days=1)).isoformat()
+    if last_day > yesterday:
+        return {"updated": False, "account": account, "from": last_day, "to": yesterday,
+                "message": f"账本已更新至 {last_day}，已晚于昨天 {yesterday}。"}
+    result = fetch_flex_report(last_day, yesterday)
+    return {"updated": True, "account": account, "from": last_day, "to": yesterday, **result}
+
+
 def all_imports(db, account=None):
     sql = "SELECT * FROM imports"
     args = []
@@ -582,6 +626,40 @@ def derive_flex_cashflow_base_amounts(events, activity_rows, base_currency):
             amount = n(events[index].get("金额"))
             events[index]["基础货币金额"] = str((1 if amount > 0 else -1) * abs(proceeds) * abs(amount) / chosen_total)
             unmatched.discard(index)
+
+
+def derive_flex_transaction_base_amounts(events, activity_rows, base_currency):
+    """Convert commissions and taxes using IBKR's transaction-time functional-currency activity."""
+    exact_rates = defaultdict(list)
+    daily_rates = defaultdict(list)
+    for row in activity_rows:
+        currency = str(row.get("FXCurrency", "") or "")
+        if not currency or currency == base_currency or row.get("FunctionalCurrency") != base_currency:
+            continue
+        quantity = n(row.get("Quantity"))
+        proceeds = n(row.get("Proceeds"))
+        if not quantity or not proceeds:
+            continue
+        raw_datetime = str(row.get("DateTime", "") or "").strip()
+        rate = abs(proceeds / quantity)
+        if raw_datetime:
+            exact_rates[(raw_datetime, currency)].append(rate)
+            day = raw_datetime[:8]
+            if re.fullmatch(r"\d{8}", day):
+                daily_rates[(day, currency)].append(rate)
+
+    for event in events:
+        currency = str(event.get("货币", "") or "")
+        amount = n(event.get("金额"))
+        if currency == base_currency:
+            event["基础货币金额"] = str(amount)
+            continue
+        raw_datetime = str(event.get("交易时间", "") or "").strip()
+        rates = exact_rates.get((raw_datetime, currency)) if raw_datetime else None
+        if not rates and raw_datetime:
+            rates = daily_rates.get((raw_datetime[:8], currency))
+        if rates:
+            event["基础货币金额"] = str(amount * (sum(rates) / len(rates)))
 
 
 def derive_flex_interest_base_amounts(events, activity_rows, base_currency, report_total):
@@ -768,7 +846,7 @@ def summary(db, account=None, date_from=None, date_to=None):
                         if v(r, "DataDiscriminator", 0) == "Summary"] if latest else []
     positions = merge_positions(position_records)
     cashflows = []
-    dividends, tax, interest = [], [], []
+    dividends, tax, trading_taxes, commissions, interest = [], [], [], [], []
     for imp in selected:
         statement_cashflows = imported_section(db, imp, "存款和取款")
         fx_rates = cashflow_fx_rates(statement_cashflows, imp.get("base_currency") or "USD")
@@ -782,7 +860,8 @@ def summary(db, account=None, date_from=None, date_to=None):
                                   "description": v(r, "描述", 2), "amount": n(amount),
                                   "_base_amount": converted_amount,
                                   "period": imp["period_end"]})
-        for section, target in (("股息", dividends), ("代扣税", tax), ("利息", interest)):
+        for section, target in (("股息", dividends), ("代扣税", tax), ("交易税费", trading_taxes),
+                                ("手续费", commissions), ("利息", interest)):
             records = imported_section(db, imp, section)
             if section == "利息":
                 flex_cash_transactions = [r for r in records
@@ -826,18 +905,33 @@ def summary(db, account=None, date_from=None, date_to=None):
         return out
     cashflows = dedupe(cashflows, "cashflow")
     dividends = dedupe(dividends, "dividend")
-    tax, interest = map(dedupe, (tax, interest))
+    tax, trading_taxes, commissions, interest = map(dedupe, (tax, trading_taxes, commissions, interest))
     all_cashflows = cashflows
     def in_range(event):
         return (not date_from or not event["date"] or event["date"] >= date_from) and (not date_to or not event["date"] or event["date"] <= date_to)
-    cashflows, dividends, tax, interest = ([e for e in events if in_range(e)]
-                                           for events in (cashflows, dividends, tax, interest))
+    cashflows, dividends, tax, trading_taxes, commissions, interest = (
+        [e for e in events if in_range(e)]
+        for events in (cashflows, dividends, tax, trading_taxes, commissions, interest))
     # Convert each currency using IBKR's translated subtotals; detail rows retain their original currency.
     net_flows = sum(e["_base_amount"] for e in cashflows)
     deposit_total = net_flows
     base_dividends = sum(e["_base_amount"] for e in dividends)
     base_tax = sum(e["_base_amount"] for e in tax)
+    base_trading_taxes = sum(e["_base_amount"] for e in trading_taxes)
     base_interest = sum(e["_base_amount"] for e in interest)
+    commission_summary_periods = set()
+    commission_summary_total = 0.0
+    for imp in selected:
+        if ((date_from and imp.get("period_start") and imp["period_start"] < date_from) or
+                (date_to and imp.get("period_end") and imp["period_end"] > date_to)):
+            continue
+        summary_row = next((row for row in imported_section(db, imp, "净资产值变更")
+                            if v(row, "域名称", 0) == "佣金"), None)
+        if summary_row:
+            commission_summary_periods.add(imp["period_end"])
+            commission_summary_total += n(v(summary_row, "域值", 1))
+    base_commissions = commission_summary_total + sum(
+        event["_base_amount"] for event in commissions if event["period"] not in commission_summary_periods)
     nlv_value = n(v(nav_total, "当前合计", 4)) if nav_total else 0
     cash_value = n(v(nav_cash, "当前合计", 4)) if nav_cash else 0
     equity_value = n(v(nav_equity, "当前合计", 4)) if nav_equity else 0
@@ -1059,6 +1153,8 @@ def summary(db, account=None, date_from=None, date_to=None):
     recent_cashflows = sorted(cashflows, key=lambda e: e["date"], reverse=True)[:100]
     recent_dividends = sorted(dividends, key=lambda e: e["date"], reverse=True)[:100]
     recent_tax = sorted(tax, key=lambda e: e["date"], reverse=True)[:100]
+    recent_trading_taxes = sorted(trading_taxes, key=lambda e: e["date"], reverse=True)[:100]
+    recent_commissions = sorted(commissions, key=lambda e: e["date"], reverse=True)[:100]
     recent_interest = sorted(interest, key=lambda e: e["date"], reverse=True)[:100]
     trades = unpack(db, iid, "交易")
     trade_headers = [r for r in trades if "日期/时间" in r]
@@ -1072,9 +1168,11 @@ def summary(db, account=None, date_from=None, date_to=None):
                            "price": n(v(r, "交易价格", 6)), "proceeds": n(v(r, "收益", 8)),
                            "realized": n(v(r, "已实现的损益", 11)), "mtm": n(v(r, "按市值计算的损益", 12)),
                            "side": v(r, "买卖", 13)})
-    for events in (cashflows, dividends, tax, interest):
+    for events in (cashflows, dividends, tax, trading_taxes, commissions, interest):
         for event in events:
+            event["base_amount"] = event.get("_base_amount")
             event.pop("_base_amount", None)
+            event.pop("period", None)
     return {"empty": False, "account": account, "accounts": accounts, "latest": latest,
             "imports": selected, "base_currency": base_currency,
             "range": {"start": date_from, "end": date_to, "min": first_date, "max": last_date},
@@ -1082,12 +1180,14 @@ def summary(db, account=None, date_from=None, date_to=None):
                      "period_realized_unrealized": range_pnl, "period_mtm": range_net_asset_change,
                      "deposits_withdrawals": deposit_total,
                      "dividends": base_dividends, "withholding_tax": base_tax,
+                     "trading_taxes": base_trading_taxes, "commissions": base_commissions,
                      "interest": base_interest},
             "positions": positions, "pnl_assets": pnl_assets, "pnl_assets_note": pnl_assets_note,
             "history": monthly, "monthly_pnl": monthly, "yearly_pnl": yearly,
             "daily_pnl": selected_daily, "nav_history": nav_history,
             "cashflows": recent_cashflows, "dividends_detail": recent_dividends,
-            "tax_detail": recent_tax, "interest_detail": recent_interest,
+            "tax_detail": recent_tax, "trading_taxes_detail": recent_trading_taxes,
+            "commissions_detail": recent_commissions, "interest_detail": recent_interest,
             "trades": sorted(trade_rows, key=lambda e: e["date"], reverse=True)[:200]}
 
 
@@ -1143,7 +1243,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 self.send_json({"error": "清空导入数据失败。"}, 500)
             return
-        if self.path in ("/api/flex/config", "/api/flex/sync"):
+        if self.path in ("/api/flex/config", "/api/flex/sync", "/api/flex/update"):
             length = int(self.headers.get("Content-Length", "0"))
             if length > 50 * 1024:
                 self.send_json({"error": "请求内容过大。"}, 413); return
@@ -1152,6 +1252,8 @@ class Handler(BaseHTTPRequestHandler):
                 if self.path == "/api/flex/config":
                     result = save_flex_config(str(payload.get("token", "")).strip(),
                                               str(payload.get("query_id", "")).strip())
+                elif self.path == "/api/flex/update":
+                    result = update_flex_report(payload.get("account"))
                 else:
                     result = fetch_flex_report(str(payload.get("from", "")), str(payload.get("to", "")))
                 self.send_json(result)
