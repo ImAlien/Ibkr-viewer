@@ -815,6 +815,39 @@ def cashflow_fx_rates(records, base_currency):
             if total and currency in base_totals}
 
 
+def time_weighted_history(nav_points, cashflows, date_from, date_to):
+    """Daily TWR estimate, treating external flows as end-of-day flows.
+
+    Keep this independent of report-wide P/L reconciliation: moving a period
+    adjustment onto its first day would distort compounded daily returns.
+    """
+    points = [p for p in nav_points if p["date"] <= date_to]
+    prior = next((p for p in reversed(points) if p["date"] < date_from), None)
+    points = ([prior] if prior else []) + [p for p in points if p["date"] >= date_from]
+    result, factor, baseline = [], 1.0, None
+    note = "按每日净值估算，出入金视为日末发生；收益逐日复利累计，未年化。可能与 IBKR 官方 TWR 有差异。"
+    for point in points:
+        if baseline is None:
+            if point["value"] > 0 and point.get("daily"):
+                baseline = point
+                result.append({"date": point["date"], "value": 0.0})
+            continue
+        if (not point.get("daily") or not baseline.get("daily") or
+                (date.fromisoformat(point["date"]) - date.fromisoformat(baseline["date"])).days > 7):
+            return {"points": [], "total": None, "note": "缺少连续日频净值，无法可靠计算此区间的时间加权收益。请补充日频 Flex 报表。"}
+        flows = sum(e["_base_amount"] for e in cashflows
+                    if baseline["date"] < e["date"] <= point["date"])
+        if baseline["value"] <= 0 or point["value"] - flows < 0:
+            return {"points": [], "total": None, "note": "此区间存在无法计算常规 TWR 的非正净值，请核对资金流和净值。"}
+        factor *= (point["value"] - flows) / baseline["value"]
+        result.append({"date": point["date"], "value": (factor - 1) * 100})
+        baseline = point
+    if len(result) < 2:
+        return {"points": [], "total": None, "note": "至少需要两个有效的日频净值点才能计算时间加权收益。"}
+    return {"points": result, "total": result[-1]["value"], "note": note,
+            "start": result[0]["date"], "end": result[-1]["date"]}
+
+
 def summary(db, account=None, date_from=None, date_to=None):
     imports = all_imports(db, account)
     if not imports:
@@ -833,13 +866,23 @@ def summary(db, account=None, date_from=None, date_to=None):
     iid = latest["id"] if latest else None
     base_currency = selected[-1].get("base_currency") or "USD"
     nlv = unpack(db, iid, "净资产值")
-    total_nav_rows = [r for r in nlv if v(r, "资产类型", 0) == "总数"]
-    dated_nav_rows = [r for r in total_nav_rows if v(r, "报告日期")]
+    daily_nav_by_key = {}
+    for imp in selected:
+        for row in unpack(db, imp["id"], "净资产值"):
+            day = str(v(row, "报告日期") or "").replace("-", "")
+            if re.fullmatch(r"\d{8}", day) and day <= date_to.replace("-", ""):
+                daily_nav_by_key[(v(row, "资产类型", 0), day)] = row
     def latest_nav(category):
+        available = [(day, row) for (asset, day), row in daily_nav_by_key.items() if asset == category]
+        if available:
+            return max(available, key=lambda item: item[0])[1]
         rows = [r for r in nlv if v(r, "资产类型", 0) == category]
         dated = [r for r in rows if v(r, "报告日期")]
         return max(dated, key=lambda r: v(r, "报告日期")) if dated else next(iter(rows), None)
     nav_total = latest_nav("总数")
+    nav_as_of = str(v(nav_total or {}, "报告日期") or (latest["period_end"] if latest else ""))
+    if re.fullmatch(r"\d{8}", nav_as_of):
+        nav_as_of = datetime.strptime(nav_as_of, "%Y%m%d").strftime("%Y-%m-%d")
     nav_cash = latest_nav("现金")
     nav_equity = latest_nav("股票")
     position_records = [r for r in imported_section(db, latest, "未平仓持仓")
@@ -935,7 +978,7 @@ def summary(db, account=None, date_from=None, date_to=None):
     nlv_value = n(v(nav_total, "当前合计", 4)) if nav_total else 0
     cash_value = n(v(nav_cash, "当前合计", 4)) if nav_cash else 0
     equity_value = n(v(nav_equity, "当前合计", 4)) if nav_equity else 0
-    nav_points = []
+    nav_by_date = {}
     for imp in selected:
         daily_nav = [r for r in unpack(db, imp["id"], "净资产值")
                      if v(r, "资产类型", 0) == "总数" and v(r, "报告日期")]
@@ -944,20 +987,18 @@ def summary(db, account=None, date_from=None, date_to=None):
                 point_date = str(v(row, "报告日期"))
                 if re.fullmatch(r"\d{8}", point_date):
                     point_date = datetime.strptime(point_date, "%Y%m%d").strftime("%Y-%m-%d")
-                point = {"date": point_date, "value": n(v(row, "当前合计", 4))}
-                if not nav_points or point["date"] > nav_points[-1]["date"]:
-                    nav_points.append(point)
+                nav_by_date[point_date] = {"date": point_date, "value": n(v(row, "当前合计", 4)), "daily": True}
             continue
         changes = unpack(db, imp["id"], "净资产值变更")
         start = next((n(v(r, "域值", 1)) for r in changes if v(r, "域名称", 0) == "开始价值"), None)
         end = next((n(v(r, "域值", 1)) for r in changes if v(r, "域名称", 0) == "结束价值"), None)
         start_date, end_date = imp["period_start"], imp["period_end"]
-        last_point_date = nav_points[-1]["date"] if nav_points else ""
-        if start is not None and start_date and (not nav_points or start_date > last_point_date):
-            nav_points.append({"date": start_date, "value": start})
-        if end is not None and end_date and (not nav_points or end_date > nav_points[-1]["date"]):
-            nav_points.append({"date": end_date, "value": end})
-    nav_points.sort(key=lambda point: point["date"])
+        if start is not None and start_date:
+            opening_date = (date.fromisoformat(start_date) - timedelta(days=1)).isoformat()
+            nav_by_date.setdefault(opening_date, {"date": opening_date, "value": start, "daily": False})
+        if end is not None and end_date:
+            nav_by_date.setdefault(end_date, {"date": end_date, "value": end, "daily": False})
+    nav_points = sorted(nav_by_date.values(), key=lambda point: point["date"])
     nav_dates = [point["date"] for point in nav_points]
     flows_by_index = defaultdict(float)
     for event in all_cashflows:
@@ -997,8 +1038,7 @@ def summary(db, account=None, date_from=None, date_to=None):
     range_pnl = sum(point["pnl"] for point in selected_daily)
     range_net_asset_change = 0
     if selected_daily:
-        first_date = selected_daily[0]["date"]
-        first_index = nav_dates.index(first_date)
+        first_index = nav_dates.index(selected_daily[0]["date"])
         range_net_asset_change = selected_daily[-1]["value"] - nav_points[max(0, first_index - 1)]["value"]
 
     monthly_totals = defaultdict(lambda: {"pnl": 0.0, "external_flows": 0.0, "trading_days": 0})
@@ -1150,6 +1190,7 @@ def summary(db, account=None, date_from=None, date_to=None):
     prior_nav_point = next((p for p in reversed(nav_points) if date_from and p["date"] < date_from), None)
     nav_history = ([prior_nav_point] if prior_nav_point else []) + [
         p for p in nav_points if (not date_from or p["date"] >= date_from) and (not date_to or p["date"] <= date_to)]
+    twr_history = time_weighted_history(nav_points, all_cashflows, date_from, date_to)
     recent_cashflows = sorted(cashflows, key=lambda e: e["date"], reverse=True)[:100]
     recent_dividends = sorted(dividends, key=lambda e: e["date"], reverse=True)[:100]
     recent_tax = sorted(tax, key=lambda e: e["date"], reverse=True)[:100]
@@ -1174,7 +1215,7 @@ def summary(db, account=None, date_from=None, date_to=None):
             event.pop("_base_amount", None)
             event.pop("period", None)
     return {"empty": False, "account": account, "accounts": accounts, "latest": latest,
-            "imports": selected, "base_currency": base_currency,
+            "imports": selected, "base_currency": base_currency, "nav_as_of": nav_as_of,
             "range": {"start": date_from, "end": date_to, "min": first_date, "max": last_date},
             "kpis": {"net_liquidation": nlv_value, "cash": cash_value, "stocks": equity_value,
                      "period_realized_unrealized": range_pnl, "period_mtm": range_net_asset_change,
@@ -1184,7 +1225,7 @@ def summary(db, account=None, date_from=None, date_to=None):
                      "interest": base_interest},
             "positions": positions, "pnl_assets": pnl_assets, "pnl_assets_note": pnl_assets_note,
             "history": monthly, "monthly_pnl": monthly, "yearly_pnl": yearly,
-            "daily_pnl": selected_daily, "nav_history": nav_history,
+            "daily_pnl": selected_daily, "nav_history": nav_history, "twr_history": twr_history,
             "cashflows": recent_cashflows, "dividends_detail": recent_dividends,
             "tax_detail": recent_tax, "trading_taxes_detail": recent_trading_taxes,
             "commissions_detail": recent_commissions, "interest_detail": recent_interest,
