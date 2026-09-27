@@ -766,6 +766,48 @@ def merge_positions(records):
     return merged
 
 
+def stock_average_prices(db, imports, asof):
+    """Rebuild average entry prices from Flex executions, including opening fees."""
+    executions = {}
+    for imp in imports:
+        sections = [row[0] for row in db.execute(
+            "SELECT DISTINCT section FROM records WHERE import_id=? AND section LIKE ?",
+            (imp["id"], "Flex:ClientAccountID,Symbol,Date/Time,Buy/Sell,Quantity,Price%"))]
+        seen_in_report = Counter()
+        for section in sections:
+            for row in imported_section(db, imp, section):
+                stamp = str(row.get("Date/Time", ""))
+                if not stamp or stamp[:8] > asof.replace("-", ""):
+                    continue
+                symbol, currency = row.get("Symbol", ""), row.get("CurrencyPrimary", "")
+                signature = (stamp, symbol, currency, row.get("Buy/Sell", ""),
+                             row.get("Quantity", ""), row.get("Price", ""),
+                             row.get("TotalCommission", ""))
+                seen_in_report[signature] += 1
+                executions.setdefault((signature, seen_in_report[signature]), row)
+    grouped = defaultdict(list)
+    for row in executions.values():
+        grouped[(row.get("Symbol", ""), row.get("CurrencyPrimary", ""))].append(row)
+    averages = {}
+    for key, rows in grouped.items():
+        quantity = cost = 0.0
+        valid = True
+        for row in sorted(rows, key=lambda item: item["Date/Time"]):
+            change = n(row.get("Quantity"))
+            if change > 0:
+                # Flex TotalCommission is negative for a charge.
+                cost += change * n(row.get("Price")) - n(row.get("TotalCommission"))
+            elif change < 0:
+                if quantity <= 0 or quantity + change < -1e-6:
+                    valid = False
+                    break
+                cost += change * cost / quantity
+            quantity += change
+        if valid and quantity > 0:
+            averages[key] = (quantity, cost / quantity)
+    return averages
+
+
 def stored_flex_parse(import_info):
     filename = str(import_info.get("filename", ""))
     if not filename.startswith("flex_"):
@@ -888,6 +930,70 @@ def summary(db, account=None, date_from=None, date_to=None):
     position_records = [r for r in imported_section(db, latest, "未平仓持仓")
                         if v(r, "DataDiscriminator", 0) == "Summary"] if latest else []
     positions = merge_positions(position_records)
+    position_date = latest["period_end"] if latest else ""
+    position_prices = {}
+    for imp in selected:
+        price_sections = [row[0] for row in db.execute(
+            "SELECT DISTINCT section FROM records WHERE import_id=? AND section LIKE ?",
+            (imp["id"], "Flex:ClientAccountID,Symbol,AssetClass,Date,Price,CurrencyPrimary%"))]
+        for section in price_sections:
+            for row in imported_section(db, imp, section):
+                day = str(row.get("Date", "")).replace("-", "")
+                if re.fullmatch(r"\d{8}", day) and day <= position_date.replace("-", ""):
+                    key = (row.get("AssetClass", ""), row.get("Symbol", ""), row.get("CurrencyPrimary", ""), day)
+                    position_prices[key] = n(row.get("Price"))
+    prior_dates = [key[3] for key in position_prices if key[3] < position_date.replace("-", "")]
+    previous_price_date = max(prior_dates, default="")
+    if previous_price_date and (date.fromisoformat(position_date) -
+                                datetime.strptime(previous_price_date, "%Y%m%d").date()).days > 7:
+        previous_price_date = ""
+
+    fx_rates = {base_currency: 1.0}
+    if latest:
+        fx_sections = [row[0] for row in db.execute(
+            "SELECT DISTINCT section FROM records WHERE import_id=? AND section LIKE ?",
+            (latest["id"], "Flex:ClientAccountID,FXCurrency,Quantity,CostPrice,CostBasis,ClosePrice%"))]
+        for section in fx_sections:
+            for row in imported_section(db, latest, section):
+                rate = n(row.get("ClosePrice"))
+                if rate > 0:
+                    fx_rates[row.get("FXCurrency", "")] = rate
+    stock_averages = stock_average_prices(db, selected, position_date) if latest else {}
+    position_categories = defaultdict(lambda: {"gross_value": 0.0, "count": 0})
+    position_stocks = defaultdict(lambda: {"gross_value": 0.0, "count": 0})
+    missing_position_rates = set()
+    for row in positions:
+        asset, symbol, currency = (v(row, "资产分类", 1), v(row, "代码", 3), v(row, "货币", 2))
+        current_price = n(v(row, "收盘价格", 8))
+        previous_price = position_prices.get((asset, symbol, currency, previous_price_date)) if previous_price_date else None
+        row["previous_price"] = previous_price
+        row["previous_price_date"] = (datetime.strptime(previous_price_date, "%Y%m%d").strftime("%Y-%m-%d")
+                                      if previous_price is not None else "")
+        row["day_change_pct"] = ((current_price / previous_price - 1) * 100
+                                 if previous_price is not None and previous_price > 0 else None)
+        cost_basis = n(v(row, "成本基础", 7))
+        row["profit_pct"] = (n(v(row, "未实现的损益", 10)) / abs(cost_basis) * 100
+                             if abs(cost_basis) > 1e-12 else None)
+        if asset == "STK":
+            average = stock_averages.get((symbol, currency))
+            if average and abs(average[0] - n(v(row, "数量", 4))) < 1e-6:
+                row["average_entry_price"] = average[1]
+        rate = fx_rates.get(currency)
+        if rate is None:
+            missing_position_rates.add(currency or "未知币种")
+            continue
+        group = position_categories[asset or "其他"]
+        group["gross_value"] += abs(n(v(row, "价值", 9)) * rate)
+        group["count"] += 1
+        if asset == "STK":
+            stock_group = position_stocks[(symbol, currency)]
+            stock_group["gross_value"] += abs(n(v(row, "价值", 9)) * rate)
+            stock_group["count"] += 1
+    position_distribution = [{"asset": asset, **amounts} for asset, amounts in position_categories.items()]
+    position_distribution.sort(key=lambda row: row["gross_value"], reverse=True)
+    stock_distribution = [{"symbol": symbol, "currency": currency, **amounts}
+                          for (symbol, currency), amounts in position_stocks.items()]
+    stock_distribution.sort(key=lambda row: row["gross_value"], reverse=True)
     cashflows = []
     dividends, tax, trading_taxes, commissions, interest = [], [], [], [], []
     for imp in selected:
@@ -1250,7 +1356,12 @@ def summary(db, account=None, date_from=None, date_to=None):
                      "dividends": base_dividends, "withholding_tax": base_tax,
                      "trading_taxes": base_trading_taxes, "commissions": base_commissions,
                      "interest": base_interest},
-            "positions": positions, "allocation": allocation, "pnl_assets": pnl_assets, "pnl_assets_note": pnl_assets_note,
+            "positions": positions, "position_distribution": position_distribution,
+            "stock_distribution": stock_distribution,
+            "position_distribution_missing_rates": sorted(missing_position_rates),
+            "previous_price_date": (datetime.strptime(previous_price_date, "%Y%m%d").strftime("%Y-%m-%d")
+                                    if previous_price_date else ""),
+            "allocation": allocation, "pnl_assets": pnl_assets, "pnl_assets_note": pnl_assets_note,
             "history": monthly, "monthly_pnl": monthly, "yearly_pnl": yearly,
             "daily_pnl": selected_daily, "nav_history": nav_history, "twr_history": twr_history,
             "cashflows": recent_cashflows, "dividends_detail": recent_dividends,
