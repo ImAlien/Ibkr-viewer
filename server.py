@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import html
 import io
 import json
 import os
@@ -441,6 +442,18 @@ def flex_xml_value(root, name):
                  if node.tag.rsplit("}", 1)[-1] == name), "")
 
 
+class FlexStatementUnavailable(ValueError):
+    pass
+
+
+def raise_flex_failure(prefix, message):
+    # IBKR sometimes returns escaped entities inside the XML error text.
+    message = html.unescape(html.unescape(str(message))).strip()
+    error_type = (FlexStatementUnavailable
+                  if re.search(r"statement\s+is\s+not\s+available", message, re.I) else ValueError)
+    raise error_type(f"{prefix}：{message}")
+
+
 def flex_error(content):
     try:
         root = ElementTree.fromstring(content)
@@ -473,7 +486,8 @@ def fetch_flex_report(date_from, date_to):
     except ElementTree.ParseError as exc:
         raise ValueError("IBKR SendRequest 返回了无法识别的响应。") from exc
     if flex_xml_value(root, "Status").lower() != "success":
-        raise ValueError(f"IBKR Flex 查询失败：{flex_xml_value(root, 'ErrorMessage') or flex_xml_value(root, 'ErrorCode') or '未知错误'}")
+        raise_flex_failure("IBKR Flex 查询失败", flex_xml_value(root, "ErrorMessage") or
+                           flex_xml_value(root, "ErrorCode") or "未知错误")
     reference = flex_xml_value(root, "ReferenceCode")
     if not reference:
         raise ValueError("IBKR 响应中缺少报告 ReferenceCode。")
@@ -487,7 +501,7 @@ def fetch_flex_report(date_from, date_to):
                 time.sleep(2)
                 continue
             if error:
-                raise ValueError(f"IBKR 获取 Flex 报告失败：{error}")
+                raise_flex_failure("IBKR 获取 Flex 报告失败", error)
         break
     extension = "xml" if report.lstrip().startswith(b"<") else "csv"
     filename = f"flex_{query_id}_{start}_{end}.{extension}"
@@ -514,12 +528,28 @@ def update_flex_report(account=None):
     last_day = max((item.get("period_end") or "" for item in imports), default="")
     if not last_day:
         raise ValueError("账本没有可用的最后报告日期。")
+    next_day = (date.fromisoformat(last_day) + timedelta(days=1)).isoformat()
     yesterday = (datetime.now().astimezone().date() - timedelta(days=1)).isoformat()
-    if last_day > yesterday:
-        return {"updated": False, "account": account, "from": last_day, "to": yesterday,
-                "message": f"账本已更新至 {last_day}，已晚于昨天 {yesterday}。"}
-    result = fetch_flex_report(last_day, yesterday)
-    return {"updated": True, "account": account, "from": last_day, "to": yesterday, **result}
+    if next_day > yesterday:
+        return {"updated": False, "account": account, "from": next_day, "to": yesterday,
+                "message": f"账本已更新至 {last_day}，截至昨天 {yesterday} 没有待更新日期。"}
+    candidate_end = date.fromisoformat(yesterday)
+    unavailable_dates = []
+    while candidate_end.isoformat() >= next_day:
+        end_day = candidate_end.isoformat()
+        try:
+            result = fetch_flex_report(next_day, end_day)
+        except FlexStatementUnavailable:
+            unavailable_dates.append(end_day)
+            candidate_end -= timedelta(days=1)
+            continue
+        return {"updated": True, "account": account, "from": next_day, "to": end_day,
+                "requested_to": yesterday, "unavailable_dates": unavailable_dates, **result}
+    return {"updated": False, "account": account, "from": next_day,
+            "to": candidate_end.isoformat(), "requested_to": yesterday,
+            "unavailable_dates": unavailable_dates,
+            "message": f"IBKR 暂未提供 {next_day} 至 {yesterday} 的新增报告；"
+                       f"已回退至 {candidate_end.isoformat()}，该日期已在账本中，无需更新。"}
 
 
 def all_imports(db, account=None):
