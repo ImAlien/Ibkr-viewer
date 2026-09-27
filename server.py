@@ -808,6 +808,103 @@ def stock_average_prices(db, imports, asof):
     return averages
 
 
+def collect_trades(db, imports, date_from, date_to):
+    """Collect executions across reports, keeping repeated fills but removing report overlap."""
+    trade_rows = []
+    seen_counts = {}
+    for imp in imports:
+        commission_by_execution = defaultdict(list)
+        sections = [row[0] for row in db.execute(
+            "SELECT DISTINCT section FROM records WHERE import_id=? AND section LIKE ?",
+            (imp["id"], "Flex:ClientAccountID,Symbol,Date/Time,Buy/Sell,Quantity,Price%"))]
+        for section in sections:
+            for row in imported_section(db, imp, section):
+                key = (row.get("Date/Time", ""), row.get("Symbol", ""),
+                       row.get("CurrencyPrimary", ""), n(row.get("Quantity")), n(row.get("Price")))
+                commission_by_execution[key].append(n(row.get("TotalCommission")))
+        commission_indices = Counter()
+        taxes_by_execution = defaultdict(float)
+        for row in imported_section(db, imp, "交易税费"):
+            stamp = str(v(row, "交易时间") or "")
+            if stamp:
+                taxes_by_execution[(stamp, v(row, "货币", 0))] += n(v(row, "金额", 3))
+        actual = [row for row in imported_section(db, imp, "交易")
+                  if v(row, "DataDiscriminator", 0) == "Trade" and v(row, "收益", 8) not in (None, "")]
+        proceeds_by_stamp = defaultdict(float)
+        for row in actual:
+            proceeds_by_stamp[(v(row, "日期/时间", 4), v(row, "货币", 2))] += abs(n(v(row, "收益", 8)))
+        local_counts = Counter()
+        for row in actual:
+            stamp = str(v(row, "日期/时间", 4) or "")
+            match = re.match(r"(\d{4})-?(\d{2})-?(\d{2})", stamp)
+            if not match:
+                continue
+            trade_date = "-".join(match.groups())
+            if (date_from and trade_date < date_from) or (date_to and trade_date > date_to):
+                continue
+            asset, currency, symbol = (v(row, "资产分类", 1), v(row, "货币", 2), v(row, "代码", 3))
+            quantity, price = n(v(row, "数量", 5)), n(v(row, "交易价格", 6))
+            proceeds, realized, mtm = (n(v(row, "收益", 8)), n(v(row, "已实现的损益", 11)),
+                                       n(v(row, "按市值计算的损益", 12)))
+            side = v(row, "买卖", 13)
+            signature = (stamp, asset, currency, symbol, side, quantity, price, proceeds, realized, mtm)
+            local_counts[signature] += 1
+            commission_key = (stamp, symbol, currency, quantity, price)
+            index = commission_indices[commission_key]
+            commission_indices[commission_key] += 1
+            if local_counts[signature] <= seen_counts.get(signature, 0):
+                continue
+            commissions = commission_by_execution[commission_key]
+            commission = commissions[index] if index < len(commissions) else None
+            if commission is None and v(row, "佣金", 14) not in (None, ""):
+                commission = n(v(row, "佣金", 14))
+            stamp_key = (stamp, currency)
+            denominator = proceeds_by_stamp[stamp_key]
+            trading_fees = (taxes_by_execution[stamp_key] * abs(proceeds) / denominator
+                            if denominator else 0.0)
+            trade_rows.append({"type": "Trade", "asset": asset, "currency": currency,
+                               "symbol": symbol, "date": trade_date, "time": stamp,
+                               "quantity": quantity, "price": price, "proceeds": proceeds,
+                               "realized": realized, "mtm": mtm, "side": side,
+                               "commission": commission, "trading_fees": trading_fees})
+        for signature, count in local_counts.items():
+            seen_counts[signature] = max(seen_counts.get(signature, 0), count)
+    return sorted(trade_rows, key=lambda row: row["time"], reverse=True)
+
+
+def merge_trade_fills(trades):
+    """Combine execution fills that share a timestamp and contract into one order."""
+    orders = {}
+    for index, trade in enumerate(trades):
+        stamp = trade["time"]
+        # These Flex files omit an order ID. Restrict the fallback to a full
+        # execution timestamp so date-only records remain separate.
+        key = ((stamp, trade["asset"], trade["currency"], trade["symbol"], trade["side"])
+               if re.fullmatch(r"\d{8};\d{6}", stamp) else ("single", index))
+        if key not in orders:
+            orders[key] = {**trade, "quantity": 0.0, "price": 0.0, "proceeds": 0.0,
+                           "realized": 0.0, "mtm": 0.0, "commission": None,
+                           "trading_fees": 0.0, "fill_count": 0, "fills": []}
+        order = orders[key]
+        order["fills"].append(trade)
+        order["fill_count"] += 1
+        order["quantity"] += trade["quantity"]
+        order["proceeds"] += trade["proceeds"]
+        order["realized"] += trade["realized"]
+        order["mtm"] += trade["mtm"]
+        order["trading_fees"] += trade["trading_fees"]
+        if trade["commission"] is not None:
+            order["commission"] = (order["commission"] or 0.0) + trade["commission"]
+    for order in orders.values():
+        fills = order["fills"]
+        weight = sum(abs(fill["quantity"]) for fill in fills)
+        order["price"] = (sum(abs(fill["quantity"]) * fill["price"] for fill in fills) / weight
+                          if weight else fills[0]["price"])
+        if len(fills) == 1:
+            order["fills"] = []
+    return list(orders.values())
+
+
 def stored_flex_parse(import_info):
     filename = str(import_info.get("filename", ""))
     if not filename.startswith("flex_"):
@@ -1330,18 +1427,8 @@ def summary(db, account=None, date_from=None, date_to=None):
     recent_trading_taxes = sorted(trading_taxes, key=lambda e: e["date"], reverse=True)[:100]
     recent_commissions = sorted(commissions, key=lambda e: e["date"], reverse=True)[:100]
     recent_interest = sorted(interest, key=lambda e: e["date"], reverse=True)[:100]
-    trades = unpack(db, iid, "交易")
-    trade_headers = [r for r in trades if "日期/时间" in r]
-    trade_rows = []
-    for r in trade_headers:
-        discriminator = v(r, "DataDiscriminator", 0)
-        if discriminator not in ("Order", "Trade"):
-            continue
-        trade_rows.append({"type": discriminator, "asset": v(r, "资产分类", 1), "currency": v(r, "货币", 2),
-                           "symbol": v(r, "代码", 3), "date": v(r, "日期/时间", 4), "quantity": n(v(r, "数量", 5)),
-                           "price": n(v(r, "交易价格", 6)), "proceeds": n(v(r, "收益", 8)),
-                           "realized": n(v(r, "已实现的损益", 11)), "mtm": n(v(r, "按市值计算的损益", 12)),
-                           "side": v(r, "买卖", 13)})
+    trade_fills = collect_trades(db, selected, date_from, date_to)
+    trade_rows = merge_trade_fills(trade_fills)
     for events in (cashflows, dividends, tax, trading_taxes, commissions, interest):
         for event in events:
             event["base_amount"] = event.get("_base_amount")
@@ -1367,7 +1454,7 @@ def summary(db, account=None, date_from=None, date_to=None):
             "cashflows": recent_cashflows, "dividends_detail": recent_dividends,
             "tax_detail": recent_tax, "trading_taxes_detail": recent_trading_taxes,
             "commissions_detail": recent_commissions, "interest_detail": recent_interest,
-            "trades": sorted(trade_rows, key=lambda e: e["date"], reverse=True)[:200]}
+            "trades": trade_rows, "trade_fills_count": len(trade_fills)}
 
 
 class Handler(BaseHTTPRequestHandler):
