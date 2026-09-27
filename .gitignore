@@ -1,3 +1,25 @@
 __pycache__/
 data/
 *.py[cod]
+
+# Local IBKR statements, databases, and credentials (also if saved outside data/).
+flex_reports/
+reports/
+statements/
+exports/
+*.csv
+*.tsv
+*.xls
+*.xlsx
+*.xml
+*.sqlite*
+*.db
+*.db-*
+flex_config.json
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.log
