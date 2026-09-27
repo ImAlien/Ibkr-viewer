@@ -987,6 +987,161 @@ def time_weighted_history(nav_points, cashflows, date_from, date_to):
             "start": result[0]["date"], "end": result[-1]["date"]}
 
 
+def security_performance(db, selected, date_from, date_to):
+    # IBKR's MTMPerformanceSummary carries per-security totals at report-period granularity.
+    security_totals = defaultdict(float)
+    covered_stock_imports = []
+    stock_covered_until = ""
+    partial_stock_periods = []
+    for imp in selected:
+        period_start, period_end = imp["period_start"], imp["period_end"]
+        if not period_start or not period_end:
+            continue
+        if (date_from and period_start < date_from) or (date_to and period_end > date_to):
+            if (not date_to or period_start <= date_to) and (not date_from or period_end >= date_from):
+                partial_stock_periods.append(f"{period_start} – {period_end}")
+            continue
+        if stock_covered_until and period_start <= stock_covered_until:
+            continue
+        security_rows = [row for row in imported_section(db, imp, "按市值计算的表现总结")
+                         if v(row, "资产分类", 0) in ("STK", "OPT") and v(row, "代码", 1)]
+        if not security_rows:
+            continue
+        covered_stock_imports.append(imp)
+        for row in security_rows:
+            asset = v(row, "资产分类", 0)
+            symbol = v(row, "代码", 1)
+            if asset not in ("STK", "OPT") or not symbol:
+                continue
+            security_totals[(asset, symbol)] += n(v(row, "按市值计算的损益", 2))
+        stock_covered_until = period_end
+
+    contract_underlyings = {}
+    root_underlyings = {}
+    stock_descriptions = {}
+    for imp in covered_stock_imports:
+        sections = [row[0] for row in db.execute("SELECT DISTINCT section FROM records WHERE import_id=?", (imp["id"],))]
+        for section in sections:
+            if not section.startswith("Flex:"):
+                continue
+            for row in unpack(db, imp["id"], section):
+                symbol = str(row.get("Symbol", "") or "").strip()
+                underlying = str(row.get("UnderlyingSymbol", "") or "").strip()
+                asset = str(row.get("AssetClass", "") or "").strip()
+                if asset == "STK" and symbol and row.get("Description"):
+                    stock_descriptions[symbol] = row["Description"]
+                if asset == "OPT" and symbol:
+                    description_root = str(row.get("Description", "") or "").strip().split()
+                    if description_root:
+                        contract_underlyings[symbol] = description_root[0]
+                        root_underlyings[symbol.split()[0]] = description_root[0]
+                if symbol and underlying and symbol != underlying:
+                    contract_underlyings[symbol] = underlying
+                    root_underlyings[symbol.split()[0]] = underlying
+
+    def underlying_for(asset, symbol):
+        if asset == "STK":
+            return symbol
+        if symbol in contract_underlyings:
+            return contract_underlyings[symbol]
+        root = symbol.split()[0] if symbol.split() else symbol
+        return root_underlyings.get(root, root)
+
+    pnl_groups = {}
+    for (asset, symbol), total in security_totals.items():
+        underlying = underlying_for(asset, symbol)
+        group = pnl_groups.setdefault(underlying, {"underlying": underlying, "description": stock_descriptions.get(underlying, ""),
+                                                   "stock_pnl": 0.0, "option_pnl": 0.0, "total": 0.0,
+                                                   "securities": [], "trades": []})
+        group["stock_pnl" if asset == "STK" else "option_pnl"] += total
+        group["total"] += total
+        group["securities"].append({"asset": asset, "symbol": symbol, "total": total})
+
+    # Use actual execution rows with proceeds to avoid repeating FIFO lot-allocation rows.
+    pnl_trades = defaultdict(list)
+    seen_trade_counts = {}
+    for imp in covered_stock_imports:
+        local_counts = Counter()
+        for row in unpack(db, imp["id"], "交易"):
+            asset = v(row, "资产分类", 1)
+            symbol = str(v(row, "代码", 3) or "").strip()
+            raw_date = str(v(row, "日期/时间", 4) or "")
+            match = re.match(r"(\d{8})", raw_date)
+            if asset not in ("STK", "OPT") or not symbol or not match or v(row, "收益", 8) in (None, ""):
+                continue
+            trade_date = datetime.strptime(match.group(1), "%Y%m%d").strftime("%Y-%m-%d")
+            if (date_from and trade_date < date_from) or (date_to and trade_date > date_to):
+                continue
+            currency = v(row, "货币", 2)
+            quantity = n(v(row, "数量", 5))
+            price = n(v(row, "交易价格", 6))
+            proceeds = n(v(row, "收益", 8))
+            realized = n(v(row, "已实现的损益", 11))
+            side = v(row, "买卖", 13)
+            signature = (trade_date, raw_date, asset, symbol, side, quantity, price, proceeds, realized, currency)
+            local_counts[signature] += 1
+            if local_counts[signature] <= seen_trade_counts.get(signature, 0):
+                continue
+            underlying = underlying_for(asset, symbol)
+            pnl_groups.setdefault(underlying, {"underlying": underlying, "description": stock_descriptions.get(underlying, ""),
+                                               "stock_pnl": 0.0, "option_pnl": 0.0, "total": 0.0,
+                                               "securities": [], "trades": []})
+            pnl_trades[underlying].append({"date": trade_date, "asset": asset, "symbol": symbol,
+                                           "action": side, "quantity": quantity, "price": price,
+                                           "currency": currency, "realized": realized})
+        for signature, count in local_counts.items():
+            seen_trade_counts[signature] = max(seen_trade_counts.get(signature, 0), count)
+
+        section_names = [row[0] for row in db.execute("SELECT DISTINCT section FROM records WHERE import_id=?", (imp["id"],))]
+        for section in section_names:
+            if not section.startswith("Flex:") or "UnderlyingSymbol" not in section:
+                continue
+            for row in unpack(db, imp["id"], section):
+                symbol = str(row.get("Symbol", "") or "").strip()
+                underlying = str(row.get("UnderlyingSymbol", "") or "").strip()
+                if not symbol or not underlying or symbol == underlying or not row.get("Expiry"):
+                    continue
+                raw_date = str(row.get("Date", "") or "")
+                if not re.fullmatch(r"\d{8}", raw_date):
+                    continue
+                trade_date = datetime.strptime(raw_date, "%Y%m%d").strftime("%Y-%m-%d")
+                if (date_from and trade_date < date_from) or (date_to and trade_date > date_to):
+                    continue
+                pnl_groups.setdefault(underlying, {"underlying": underlying, "description": stock_descriptions.get(underlying, ""),
+                                                   "stock_pnl": 0.0, "option_pnl": 0.0, "total": 0.0,
+                                                   "securities": [], "trades": []})
+                pnl_trades[underlying].append({"date": trade_date, "asset": "OPT", "symbol": symbol,
+                                               "action": row.get("Transaction Type", ""), "quantity": n(row.get("Quantity")),
+                                               "price": n(row.get("Trade Price")), "currency": row.get("CurrencyPrimary", ""),
+                                               "realized": n(row.get("RealizedPnl"))})
+
+    pnl_assets = []
+    for underlying, group in pnl_groups.items():
+        if not group["securities"]:
+            continue
+        group["securities"].sort(key=lambda row: abs(row["total"]), reverse=True)
+        group["trades"] = sorted(pnl_trades.get(underlying, []), key=lambda row: row["date"], reverse=True)
+        pnl_assets.append(group)
+    pnl_assets.sort(key=lambda group: abs(group["total"]), reverse=True)
+    pnl_assets_note = ("股票和期权盈亏使用 IBKR MTMPerformanceSummary 的基础货币值，仅显示完整落入所选日期的 Flex 报告；"
+                       "部分报告区间暂不拆分。" if partial_stock_periods else
+                       "期权已按 IBKR 提供的 UnderlyingSymbol / 合约描述并入对应股票。汇总使用基础货币的 MTM 盈亏；展开明细显示逐笔已实现盈亏（成交币种），未实现盈亏保留在证券汇总中。")
+    coverage = [{"start": imp["period_start"], "end": imp["period_end"]} for imp in covered_stock_imports]
+    cursor = date.fromisoformat(date_from)
+    finish = date.fromisoformat(date_to)
+    gaps = []
+    for interval in coverage:
+        left, right = date.fromisoformat(interval["start"]), date.fromisoformat(interval["end"])
+        if left > cursor:
+            gaps.append({"start": cursor.isoformat(), "end": (left - timedelta(days=1)).isoformat()})
+        cursor = max(cursor, right + timedelta(days=1))
+    if cursor <= finish:
+        gaps.append({"start": cursor.isoformat(), "end": finish.isoformat()})
+    return {"groups": pnl_assets, "start": date_from, "end": date_to,
+            "coverage": coverage, "gaps": gaps, "complete": not gaps,
+            "note": "按完整覆盖的 IBKR 证券 MTM 报表汇总；期权并入对应正股，交易明细保留成交原币。"}
+
+
 def summary(db, account=None, date_from=None, date_to=None):
     imports = all_imports(db, account)
     if not imports:
@@ -1285,138 +1440,25 @@ def summary(db, account=None, date_from=None, date_to=None):
     monthly = [{"month": month, **values} for month, values in sorted(monthly_totals.items())]
     yearly = [{"year": year, **values} for year, values in sorted(yearly_totals.items())]
 
-    # IBKR's MTMPerformanceSummary carries per-security totals at report-period granularity.
-    security_totals = defaultdict(float)
-    covered_stock_imports = []
-    stock_covered_until = ""
-    partial_stock_periods = []
-    for imp in selected:
-        period_start, period_end = imp["period_start"], imp["period_end"]
-        if not period_start or not period_end:
-            continue
-        if (date_from and period_start < date_from) or (date_to and period_end > date_to):
-            if (not date_to or period_start <= date_to) and (not date_from or period_end >= date_from):
-                partial_stock_periods.append(f"{period_start} – {period_end}")
-            continue
-        if stock_covered_until and period_start <= stock_covered_until:
-            continue
-        covered_stock_imports.append(imp)
-        for row in imported_section(db, imp, "按市值计算的表现总结"):
-            asset = v(row, "资产分类", 0)
-            symbol = v(row, "代码", 1)
-            if asset not in ("STK", "OPT") or not symbol:
-                continue
-            security_totals[(asset, symbol)] += n(v(row, "按市值计算的损益", 2))
-        stock_covered_until = period_end
-
-    contract_underlyings = {}
-    root_underlyings = {}
-    stock_descriptions = {}
-    for imp in covered_stock_imports:
-        sections = [row[0] for row in db.execute("SELECT DISTINCT section FROM records WHERE import_id=?", (imp["id"],))]
-        for section in sections:
-            if not section.startswith("Flex:"):
-                continue
-            for row in unpack(db, imp["id"], section):
-                symbol = str(row.get("Symbol", "") or "").strip()
-                underlying = str(row.get("UnderlyingSymbol", "") or "").strip()
-                asset = str(row.get("AssetClass", "") or "").strip()
-                if asset == "STK" and symbol and row.get("Description"):
-                    stock_descriptions[symbol] = row["Description"]
-                if asset == "OPT" and symbol:
-                    description_root = str(row.get("Description", "") or "").strip().split()
-                    if description_root:
-                        contract_underlyings[symbol] = description_root[0]
-                        root_underlyings[symbol.split()[0]] = description_root[0]
-                if symbol and underlying and symbol != underlying:
-                    contract_underlyings[symbol] = underlying
-                    root_underlyings[symbol.split()[0]] = underlying
-
-    def underlying_for(asset, symbol):
-        if asset == "STK":
-            return symbol
-        if symbol in contract_underlyings:
-            return contract_underlyings[symbol]
-        root = symbol.split()[0] if symbol.split() else symbol
-        return root_underlyings.get(root, root)
-
-    pnl_groups = {}
-    for (asset, symbol), total in security_totals.items():
-        underlying = underlying_for(asset, symbol)
-        group = pnl_groups.setdefault(underlying, {"underlying": underlying, "description": stock_descriptions.get(underlying, ""),
-                                                   "stock_pnl": 0.0, "option_pnl": 0.0, "total": 0.0,
-                                                   "securities": [], "trades": []})
-        group["stock_pnl" if asset == "STK" else "option_pnl"] += total
-        group["total"] += total
-        group["securities"].append({"asset": asset, "symbol": symbol, "total": total})
-
-    # Use actual execution rows with proceeds to avoid repeating FIFO lot-allocation rows.
-    pnl_trades = defaultdict(list)
-    seen_trade_counts = {}
-    for imp in covered_stock_imports:
-        local_counts = Counter()
-        for row in unpack(db, imp["id"], "交易"):
-            asset = v(row, "资产分类", 1)
-            symbol = str(v(row, "代码", 3) or "").strip()
-            raw_date = str(v(row, "日期/时间", 4) or "")
-            match = re.match(r"(\d{8})", raw_date)
-            if asset not in ("STK", "OPT") or not symbol or not match or v(row, "收益", 8) in (None, ""):
-                continue
-            trade_date = datetime.strptime(match.group(1), "%Y%m%d").strftime("%Y-%m-%d")
-            if (date_from and trade_date < date_from) or (date_to and trade_date > date_to):
-                continue
-            currency = v(row, "货币", 2)
-            quantity = n(v(row, "数量", 5))
-            price = n(v(row, "交易价格", 6))
-            proceeds = n(v(row, "收益", 8))
-            realized = n(v(row, "已实现的损益", 11))
-            side = v(row, "买卖", 13)
-            signature = (trade_date, raw_date, asset, symbol, side, quantity, price, proceeds, realized, currency)
-            local_counts[signature] += 1
-            if local_counts[signature] <= seen_trade_counts.get(signature, 0):
-                continue
-            underlying = underlying_for(asset, symbol)
-            pnl_groups.setdefault(underlying, {"underlying": underlying, "description": stock_descriptions.get(underlying, ""),
-                                               "stock_pnl": 0.0, "option_pnl": 0.0, "total": 0.0,
-                                               "securities": [], "trades": []})
-            pnl_trades[underlying].append({"date": trade_date, "asset": asset, "symbol": symbol,
-                                           "action": side, "quantity": quantity, "price": price,
-                                           "currency": currency, "realized": realized})
-        for signature, count in local_counts.items():
-            seen_trade_counts[signature] = max(seen_trade_counts.get(signature, 0), count)
-
-        section_names = [row[0] for row in db.execute("SELECT DISTINCT section FROM records WHERE import_id=?", (imp["id"],))]
-        for section in section_names:
-            if not section.startswith("Flex:") or "UnderlyingSymbol" not in section:
-                continue
-            for row in unpack(db, imp["id"], section):
-                symbol = str(row.get("Symbol", "") or "").strip()
-                underlying = str(row.get("UnderlyingSymbol", "") or "").strip()
-                if not symbol or not underlying or symbol == underlying or not row.get("Expiry"):
-                    continue
-                raw_date = str(row.get("Date", "") or "")
-                if not re.fullmatch(r"\d{8}", raw_date):
-                    continue
-                trade_date = datetime.strptime(raw_date, "%Y%m%d").strftime("%Y-%m-%d")
-                if (date_from and trade_date < date_from) or (date_to and trade_date > date_to):
-                    continue
-                pnl_groups.setdefault(underlying, {"underlying": underlying, "description": stock_descriptions.get(underlying, ""),
-                                                   "stock_pnl": 0.0, "option_pnl": 0.0, "total": 0.0,
-                                                   "securities": [], "trades": []})
-                pnl_trades[underlying].append({"date": trade_date, "asset": "OPT", "symbol": symbol,
-                                               "action": row.get("Transaction Type", ""), "quantity": n(row.get("Quantity")),
-                                               "price": n(row.get("Trade Price")), "currency": row.get("CurrencyPrimary", ""),
-                                               "realized": n(row.get("RealizedPnl"))})
-
-    pnl_assets = []
-    for underlying, group in pnl_groups.items():
-        group["securities"].sort(key=lambda row: abs(row["total"]), reverse=True)
-        group["trades"] = sorted(pnl_trades.get(underlying, []), key=lambda row: row["date"], reverse=True)
-        pnl_assets.append(group)
-    pnl_assets.sort(key=lambda group: abs(group["total"]), reverse=True)
-    pnl_assets_note = ("股票和期权盈亏使用 IBKR MTMPerformanceSummary 的基础货币值，仅显示完整落入所选日期的 Flex 报告；"
-                       "部分报告区间暂不拆分。" if partial_stock_periods else
-                       "期权已按 IBKR 提供的 UnderlyingSymbol / 合约描述并入对应股票。汇总使用基础货币的 MTM 盈亏；展开明细显示逐笔已实现盈亏（成交币种），未实现盈亏保留在证券汇总中。")
+    scoped_security = security_performance(db, selected, date_from, date_to)
+    pnl_assets, pnl_assets_note = scoped_security["groups"], scoped_security["note"]
+    anchor = min(date_to, last_date)
+    security_scopes = {
+        "day": (max(first_date, anchor[:7] + "-01"), anchor),
+        "month": (max(first_date, anchor[:4] + "-01-01"), anchor),
+        "year": (first_date, last_date),
+    }
+    security_cache = {(date_from, date_to): scoped_security}
+    pnl_asset_views = {}
+    for mode, (start, end) in security_scopes.items():
+        if start > end:
+            pnl_asset_views[mode] = {"groups": [], "start": start, "end": end,
+                                     "coverage": [], "gaps": [], "complete": False,
+                                     "note": "所选日期早于账本起始日期。"}
+        else:
+            if (start, end) not in security_cache:
+                security_cache[(start, end)] = security_performance(db, selected, start, end)
+            pnl_asset_views[mode] = security_cache[(start, end)]
     prior_nav_point = next((p for p in reversed(nav_points) if date_from and p["date"] < date_from), None)
     nav_history = ([prior_nav_point] if prior_nav_point else []) + [
         p for p in nav_points if (not date_from or p["date"] >= date_from) and (not date_to or p["date"] <= date_to)]
@@ -1449,6 +1491,7 @@ def summary(db, account=None, date_from=None, date_to=None):
             "previous_price_date": (datetime.strptime(previous_price_date, "%Y%m%d").strftime("%Y-%m-%d")
                                     if previous_price_date else ""),
             "allocation": allocation, "pnl_assets": pnl_assets, "pnl_assets_note": pnl_assets_note,
+            "pnl_asset_views": pnl_asset_views,
             "history": monthly, "monthly_pnl": monthly, "yearly_pnl": yearly,
             "daily_pnl": selected_daily, "nav_history": nav_history, "twr_history": twr_history,
             "cashflows": recent_cashflows, "dividends_detail": recent_dividends,
@@ -1480,6 +1523,24 @@ class Handler(BaseHTTPRequestHandler):
             date_from = params.get("from", [None])[0]
             date_to = params.get("to", [None])[0]
             with connect() as db: self.send_json(summary(db, account, date_from, date_to))
+            return
+        if parsed.path == "/api/security-performance":
+            params = parse_qs(parsed.query)
+            try:
+                start = date.fromisoformat(params.get("from", [""])[0]).isoformat()
+                end = date.fromisoformat(params.get("to", [""])[0]).isoformat()
+                if start > end:
+                    raise ValueError("开始日期不能晚于结束日期")
+                with connect() as db:
+                    imports = all_imports(db, params.get("account", [None])[0])
+                    if not imports:
+                        raise ValueError("没有可用账本")
+                    account = imports[0]["account"]
+                    selected = [imp for imp in imports if imp["account"] == account]
+                    result = security_performance(db, selected, start, end)
+                self.send_json(result)
+            except ValueError as error:
+                self.send_json({"error": str(error)}, 400)
             return
         if parsed.path == "/api/imports":
             with connect() as db: self.send_json(all_imports(db))
