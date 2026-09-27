@@ -1421,12 +1421,12 @@ def summary(db, account=None, date_from=None, date_to=None):
     nav_history = ([prior_nav_point] if prior_nav_point else []) + [
         p for p in nav_points if (not date_from or p["date"] >= date_from) and (not date_to or p["date"] <= date_to)]
     twr_history = time_weighted_history(nav_points, all_cashflows, date_from, date_to)
-    recent_cashflows = sorted(cashflows, key=lambda e: e["date"], reverse=True)[:100]
-    recent_dividends = sorted(dividends, key=lambda e: e["date"], reverse=True)[:100]
-    recent_tax = sorted(tax, key=lambda e: e["date"], reverse=True)[:100]
-    recent_trading_taxes = sorted(trading_taxes, key=lambda e: e["date"], reverse=True)[:100]
-    recent_commissions = sorted(commissions, key=lambda e: e["date"], reverse=True)[:100]
-    recent_interest = sorted(interest, key=lambda e: e["date"], reverse=True)[:100]
+    recent_cashflows = sorted(cashflows, key=lambda e: e["date"], reverse=True)
+    recent_dividends = sorted(dividends, key=lambda e: e["date"], reverse=True)
+    recent_tax = sorted(tax, key=lambda e: e["date"], reverse=True)
+    recent_trading_taxes = sorted(trading_taxes, key=lambda e: e["date"], reverse=True)
+    recent_commissions = sorted(commissions, key=lambda e: e["date"], reverse=True)
+    recent_interest = sorted(interest, key=lambda e: e["date"], reverse=True)
     trade_fills = collect_trades(db, selected, date_from, date_to)
     trade_rows = merge_trade_fills(trade_fills)
     for events in (cashflows, dividends, tax, trading_taxes, commissions, interest):
