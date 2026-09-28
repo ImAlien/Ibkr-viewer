@@ -140,7 +140,8 @@ def parse_flex_csv(content):
             continue
         is_header = row[0] in header_starts and any(
             field in row for field in ("CurrencyPrimary", "ReportDate", "Date/Time", "ActivityDescription",
-                                       "Quantity", "Total", "Name", "FromDate", "Date", "ValueDate"))
+                                       "Quantity", "Total", "Name", "FromDate", "Date", "ValueDate",
+                                       "Symbol", "AssetClass"))
         if is_header:
             if header:
                 blocks.append((header, block_rows))
@@ -222,6 +223,8 @@ def parse_flex_csv(content):
                 normalized.append(("已实现和未实现的表现总结", payload["代码"], payload))
         elif {"ReportDate", "TransactionMtmPnl", "PriorOpenMtmPnl", "Total"}.issubset(fields):
             for row in block_data:
+                if row.get("Total") in (None, ""):
+                    continue
                 payload = {"报告日期": row.get("ReportDate", ""), "资产分类": row.get("AssetClass", ""),
                            "代码": row.get("Symbol", ""), "按市值计算的损益": row.get("Total", ""),
                            "总数": row.get("Total", "")}
@@ -296,7 +299,7 @@ def parse_flex_csv(content):
                 commission = row.get("IBCommission", "")
                 payload = {"DataDiscriminator": "Trade", "资产分类": row.get("AssetClass", ""),
                            "货币": currency, "代码": symbol,
-                           "日期/时间": trade_datetime, "数量": row.get("Quantity", ""),
+                           "日期/时间": trade_datetime, "报告交易日期": row.get("TradeDate", ""), "数量": row.get("Quantity", ""),
                            "交易价格": row.get("TradePrice", ""), "收益": row.get("Proceeds", ""),
                            "已实现的损益": row.get("FifoPnlRealized", ""), "按市值计算的损益": "",
                            "买卖": row.get("Buy/Sell", ""), "佣金": commission}
@@ -894,6 +897,8 @@ def collect_trades(db, imports, date_from, date_to):
                             if denominator else 0.0)
             trade_rows.append({"type": "Trade", "asset": asset, "currency": currency,
                                "symbol": symbol, "date": trade_date, "time": stamp,
+                               "valuation_date": (str(row.get("报告交易日期") or "").replace("-", "")[:8]
+                                                  or trade_date.replace("-", "")),
                                "quantity": quantity, "price": price, "proceeds": proceeds,
                                "realized": realized, "mtm": mtm, "side": side,
                                "commission": commission, "trading_fees": trading_fees})
@@ -1017,6 +1022,123 @@ def time_weighted_history(nav_points, cashflows, date_from, date_to):
             "start": result[0]["date"], "end": result[-1]["date"]}
 
 
+def reconstruct_security_performance(db, selected, date_from, date_to):
+    """Rebuild period security MTM from reconciled executions and boundary prices."""
+    base = selected[-1].get("base_currency") or "USD"
+    prices, metadata, fx = defaultdict(dict), {}, defaultdict(dict)
+    start, end = date_from.replace("-", ""), date_to.replace("-", "")
+    dividends, dividend_seen = defaultdict(float), Counter()
+    for imp in selected:
+        local_counts = Counter()
+        for row in imported_section(db, imp, "股息"):
+            day = str(v(row, "日期", 1)).replace("-", "")[:8]
+            currency, description = str(v(row, "货币", 0)), str(v(row, "描述", 2))
+            symbol = re.match(r"^([A-Za-z0-9.]+)\s*\(", description)
+            if not symbol or not start <= day <= end or is_summary_currency(currency):
+                continue
+            amount = n(v(row, "金额", 3))
+            signature = (day, currency, description, amount)
+            local_counts[signature] += 1
+            if local_counts[signature] > dividend_seen[signature]:
+                dividends[("STK", symbol.group(1), currency)] += amount
+        for signature, count in local_counts.items():
+            dividend_seen[signature] = max(dividend_seen[signature], count)
+        parsed = stored_flex_parse(imp)
+        if parsed is None:
+            continue
+        for section, _, row in parsed["records"]:
+            if section.startswith("Flex:ClientAccountID,Symbol,AssetClass,Date,Price,CurrencyPrimary"):
+                day = str(row.get("Date", "")).replace("-", "")
+                if re.fullmatch(r"\d{8}", day) and row.get("Price") not in (None, ""):
+                    prices[(row.get("AssetClass"), row.get("Symbol"), row.get("CurrencyPrimary"))][day] = n(row["Price"])
+            if section.startswith("Flex:Symbol,AssetClass"):
+                metadata[(row.get("AssetClass"), row.get("Symbol"))] = row
+            if row.get("FunctionalCurrency") == base and row.get("FXCurrency"):
+                quantity, proceeds = n(row.get("Quantity")), n(row.get("Proceeds"))
+                day = str(row.get("DateTime", ""))[:8]
+                if quantity and proceeds and re.fullmatch(r"\d{8}", day):
+                    fx[row["FXCurrency"]][day] = abs(proceeds / quantity)
+    latest = max(selected, key=lambda imp: (imp["period_end"], imp["id"]))
+    last = latest["period_end"].replace("-", "")
+    first = min(imp["period_start"] for imp in selected)
+    trades = collect_trades(db, selected, first, latest["period_end"])
+    by_security = defaultdict(list)
+    for trade in trades:
+        if trade["asset"] in ("STK", "OPT") and trade["valuation_date"] <= last:
+            by_security[(trade["asset"], trade["symbol"], trade["currency"])].append(trade)
+    final = {(r["资产分类"], r["代码"], r["货币"]): n(r["数量"])
+             for r in merge_positions(imported_section(db, latest, "未平仓持仓"))}
+    groups, missing, estimated = {}, [], set()
+    for key in set(by_security) | set(final) | set(dividends):
+        asset, symbol, currency = key
+        records = by_security[key]
+        opening = sum(t["quantity"] for t in records if t["valuation_date"] < start)
+        period_trades = [t for t in records if start <= t["valuation_date"] <= end]
+        if abs(opening) < 1e-8 and not period_trades and not dividends.get(key):
+            continue
+        # Unknown opening inventory, transfers or corporate actions must not be
+        # silently treated as trading gains. All imported executions must tie out.
+        if abs(sum(t["quantity"] for t in records) - final.get(key, 0)) > 1e-6:
+            missing.append(f"{symbol}：成交数量与期末持仓不符")
+            continue
+        meta = metadata.get((asset, symbol), {})
+        multiplier = n(meta.get("Multiplier")) if asset == "OPT" else 1.0
+        if not multiplier:
+            missing.append(f"{symbol}：缺少合约乘数")
+            continue
+        closing = opening + sum(t["quantity"] for t in period_trades)
+        quotes = prices.get(key, {})
+        before = max((day for day in quotes if day < start), default="")
+        after = max((day for day in quotes if day <= end), default="")
+        def boundary_price(quantity, quote_day, boundary):
+            if abs(quantity) < 1e-8:
+                return 0.0
+            if not quote_day or (boundary - datetime.strptime(quote_day, "%Y%m%d").date()).days > 7:
+                return None
+            return quotes[quote_day]
+        opening_price = boundary_price(opening, before, date.fromisoformat(date_from))
+        closing_price = boundary_price(closing, after, date.fromisoformat(date_to))
+        if opening_price is None or closing_price is None:
+            missing.append(f"{symbol}：缺少期初或期末收盘价")
+            continue
+        if any(t["commission"] is None for t in period_trades):
+            missing.append(f"{symbol}：缺少成交佣金")
+            continue
+        local_total = (closing * closing_price - opening * opening_price) * multiplier
+        local_total += sum(t["proceeds"] + t["commission"] for t in period_trades)
+        local_total += dividends.get(key, 0.0)
+        rate = 1.0
+        if currency != base:
+            rates = [value for day, value in fx[currency].items() if start <= day <= end]
+            if not rates:
+                prior = max((day for day in fx[currency] if day <= end), default="")
+                rates = [fx[currency][prior]] if prior else []
+            if not rates:
+                missing.append(f"{symbol}：缺少历史汇率")
+                continue
+            rate = sum(rates) / len(rates)
+            estimated.add(currency)
+        total = local_total * rate
+        underlying = symbol if asset == "STK" else (meta.get("UnderlyingSymbol") or
+                     str(meta.get("Description") or symbol).split()[0])
+        group = groups.setdefault(underlying, {"underlying": underlying, "description": "",
+                     "stock_pnl": 0.0, "option_pnl": 0.0, "total": 0.0, "securities": [], "trades": []})
+        group["stock_pnl" if asset == "STK" else "option_pnl"] += total
+        group["total"] += total
+        group["securities"].append({"asset": asset, "symbol": symbol, "total": total,
+                                    "local_total": local_total, "currency": currency})
+        group["trades"].extend({**t, "action": t["side"],
+                                "date": datetime.strptime(t["valuation_date"], "%Y%m%d").strftime("%Y-%m-%d")}
+                               for t in period_trades)
+    for group in groups.values():
+        group["trades"].sort(key=lambda t: t["date"], reverse=True)
+    return {"groups": sorted(groups.values(), key=lambda g: abs(g["total"]), reverse=True),
+            "start": date_from, "end": date_to, "coverage": [], "gaps": [],
+            "complete": not missing, "method": "reconstructed", "missing_securities": missing,
+            "estimated_currencies": sorted(estimated),
+            "note": "按期末市值减期初市值，再加区间成交收支、佣金和股息重建盈亏；不含利息及单列税费。"}
+
+
 def security_performance(db, selected, date_from, date_to):
     # IBKR's MTMPerformanceSummary carries per-security totals at report-period granularity.
     security_totals = defaultdict(float)
@@ -1034,7 +1156,8 @@ def security_performance(db, selected, date_from, date_to):
         if stock_covered_until and period_start <= stock_covered_until:
             continue
         security_rows = [row for row in imported_section(db, imp, "按市值计算的表现总结")
-                         if v(row, "资产分类", 0) in ("STK", "OPT") and v(row, "代码", 1)]
+                         if v(row, "资产分类", 0) in ("STK", "OPT") and v(row, "代码", 1)
+                         and v(row, "按市值计算的损益", 2) not in (None, "")]
         if not security_rows:
             continue
         covered_stock_imports.append(imp)
@@ -1167,6 +1290,10 @@ def security_performance(db, selected, date_from, date_to):
         cursor = max(cursor, right + timedelta(days=1))
     if cursor <= finish:
         gaps.append({"start": cursor.isoformat(), "end": finish.isoformat()})
+    if gaps:
+        reconstructed = reconstruct_security_performance(db, selected, date_from, date_to)
+        if reconstructed["groups"]:
+            return reconstructed
     return {"groups": pnl_assets, "start": date_from, "end": date_to,
             "coverage": coverage, "gaps": gaps, "complete": not gaps,
             "note": "按完整覆盖的 IBKR 证券 MTM 报表汇总；期权并入对应正股，交易明细保留成交原币。"}
