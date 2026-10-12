@@ -8,6 +8,8 @@ import json
 import os
 import re
 import sqlite3
+import socket
+import ssl
 import time
 from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta
@@ -16,7 +18,8 @@ from email.policy import default
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlparse
-from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
+from urllib.request import ProxyHandler, Request, build_opener, urlopen
 from xml.etree import ElementTree
 
 ROOT = Path(__file__).resolve().parent
@@ -411,7 +414,8 @@ def read_flex_config():
         config = json.loads(FLEX_CONFIG_PATH.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         config = {}
-    return {"token": str(config.get("token", "")), "query_id": str(config.get("query_id", ""))}
+    return {"token": str(config.get("token", "")), "query_id": str(config.get("query_id", "")),
+            "proxy_url": str(config.get("proxy_url", ""))}
 
 
 def save_flex_config(token, query_id):
@@ -423,18 +427,39 @@ def save_flex_config(token, query_id):
     if not query_id.isdigit():
         raise ValueError("Query ID 必须是数字。")
     FLEX_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    FLEX_CONFIG_PATH.write_text(json.dumps({"token": token, "query_id": query_id}), encoding="utf-8")
+    FLEX_CONFIG_PATH.write_text(json.dumps({**current, "token": token, "query_id": query_id}), encoding="utf-8")
     return {"configured": True, "query_id": query_id}
 
 
 def flex_get(params):
-    request = Request(f"{FLEX_BASE_URL}/{params.pop('_endpoint')}?{urlencode(params)}",
+    params = dict(params)
+    endpoint = params.pop('_endpoint')
+    request = Request(f"{FLEX_BASE_URL}/{endpoint}?{urlencode(params)}",
                       headers={"User-Agent": "IBKR Portfolio Viewer/1.0"})
+    proxy = os.environ.get("IBKR_FLEX_PROXY") or read_flex_config()["proxy_url"]
+    if proxy and (urlparse(proxy).scheme not in ("http", "https") or not urlparse(proxy).hostname):
+        raise ValueError("Flex 代理地址格式错误，请使用 http://主机:端口 或 https://主机:端口。")
+    opener = build_opener(ProxyHandler({"http": proxy, "https": proxy})) if proxy else build_opener()
     try:
-        with urlopen(request, timeout=60) as response:
+        with opener.open(request, timeout=60) as response:
             content = response.read(50 * 1024 * 1024 + 1)
     except Exception as exc:
-        raise ValueError("连接 IBKR Flex Web Service 失败，请检查网络和 Flex 配置。") from exc
+        # Never include exception text: urllib errors can contain the token-bearing URL.
+        reason = exc.reason if isinstance(exc, URLError) else exc
+        if isinstance(exc, HTTPError):
+            detail = f"HTTP {exc.code}"
+        elif isinstance(reason, (TimeoutError, socket.timeout)):
+            detail = "连接或读取超时"
+        elif isinstance(reason, ssl.SSLError):
+            detail = "TLS 安全连接失败"
+        elif isinstance(reason, socket.gaierror):
+            detail = "域名解析失败"
+        elif isinstance(reason, ConnectionRefusedError):
+            detail = "连接被拒绝，请确认代理或目标服务正在运行"
+        else:
+            detail = "网络连接中断或无法建立连接"
+        route = "已配置 Flex 专用代理" if proxy else "使用服务进程的环境或系统代理设置"
+        raise ValueError(f"IBKR Flex {endpoint} 失败：{detail}（{route}）。") from exc
     if len(content) > 50 * 1024 * 1024:
         raise ValueError("IBKR 返回的报告超过 50 MB。")
     return content
